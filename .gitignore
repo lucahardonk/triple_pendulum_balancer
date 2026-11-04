@@ -223,3 +223,28 @@ __marimo__/
 /ros2_ws/build/
 /ros2_ws/install/
 /ros2_ws/log/
+
+# ROS 2 / colcon
+/ros2_ws/build/
+/ros2_ws/install/
+/ros2_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ambienti virtuali
+.venv/
+.venv-*/
+venv/
+
+# Segreti locali
+.env
+.env.*
+!.env.example
