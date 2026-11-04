@@ -305,31 +305,43 @@ Encoder top(TOP_PIN_A, TOP_PIN_B, ENCODER_CPR);
 constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr int64_t TX_PERIOD_US = 1000;  // Frequenza richiesta: 1 kHz.
 
-// Un solo produttore scrive sulla seriale: questa funzione.
-// Se manca spazio, il frame viene scartato e non conservato per dopo.
+// Chiamare a ogni loop. Un solo frame pendente, nessuna coda di campioni.
+// Un frame iniziato viene completato prima di prepararne un altro.
 void sendSample() {
-  char frame[128];
+  static char frame[128];
+  static size_t length = 0;
+  static size_t sent = 0;
+  static int64_t lastTxUs = 0;
 
-  const int length = snprintf(
-    frame,
-    sizeof(frame),
-    "%.4f,%.3f,%.4f,%.3f,%.4f,%.3f\n",
-    bottom.angleRad(), bottom.velocityRadS(),
-    middle.angleRad(), middle.velocityRadS(),
-    top.angleRad(), top.velocityRadS()
-  );
+  const int64_t nowUs = esp_timer_get_time();
 
-  if (length <= 0 || length >= static_cast<int>(sizeof(frame))) {
-    return;
+  if (sent == length) {
+    if (nowUs - lastTxUs < TX_PERIOD_US) return;
+    lastTxUs = nowUs;
+
+    const int n = snprintf(
+      frame, sizeof(frame),
+      "%.4f,%.3f,%.4f,%.3f,%.4f,%.3f\n",
+      bottom.angleRad(), bottom.velocityRadS(),
+      middle.angleRad(), middle.velocityRadS(),
+      top.angleRad(), top.velocityRadS()
+    );
+
+    if (n <= 0 || n >= static_cast<int>(sizeof(frame))) return;
+    length = static_cast<size_t>(n);
+    sent = 0;
   }
 
-  if (Serial.availableForWrite() < length) {
-    return;
-  }
+  const int available = Serial.availableForWrite();
+  if (available <= 0) return;
 
-  Serial.write(
-    reinterpret_cast<const uint8_t*>(frame),
-    static_cast<size_t>(length)
+  const size_t remaining = length - sent;
+  const size_t chunk = remaining < static_cast<size_t>(available)
+                     ? remaining : static_cast<size_t>(available);
+
+  // Conserva gli eventuali byte non accettati per il prossimo giro.
+  sent += Serial.write(
+    reinterpret_cast<const uint8_t*>(frame) + sent, chunk
   );
 }
 
@@ -347,14 +359,20 @@ void setup() {
       delay(1000);
     }
   }
+  //delay(5000);
+  //Serial.printf("CPU clock: %u MHz\n", (unsigned)getCpuFrequencyMhz());
+  
 }
 
 void loop() {
+
+
   // 1. Aggiorna continuamente i tre encoder.
   bottom.update();
   middle.update();
   top.update();
 
+  
   // 2. Legge al massimo un comando per giro, senza attese.
   if (Serial.available() > 0) {
     const char command = Serial.read();
@@ -366,13 +384,9 @@ void loop() {
     }
   }
 
-  // 3. Invia al massimo un frame ogni millisecondo.
-  // Nessuna raffica di recupero se un invio e' in ritardo.
-  static int64_t lastTxUs = 0;
-  const int64_t nowUs = esp_timer_get_time();
-
-  if (nowUs - lastTxUs >= TX_PERIOD_US) {
-    lastTxUs = nowUs;
-    sendSample();
-  }
+  // 3. Gestisce la trasmissione senza cicli di attesa.
+  // La funzione prepara al massimo un nuovo frame ogni millisecondo
+  // e completa eventuali scritture parziali nei giri successivi.
+  sendSample();
+ 
 }
