@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""Single-node ROS 2 ODrive USB driver.
-
-Topics:
-  ~/command   std_msgs/Float64: rad, rad/s or N*m, according to mode
-  ~/request   std_msgs/String: JSON administrative requests
-  ~/response  std_msgs/String: JSON request results
-  ~/feedback  std_msgs/String: JSON SI telemetry
-
-Services (std_srvs/Trigger):
-  ~/set_idle
-  ~/set_closed_loop
-  ~/set_vel_mode
-  ~/set_position_mode
-  ~/set_torque_mode
-  ~/set_passthrough
-  ~/set_ramped       velocity ramp / position trajectory / torque ramp
-  ~/set_position_filter
-  ~/get_status
-
-All USB access belongs to one worker thread.
-No automatic calibration, error clearing, flash saving or reconnection.
-No host command timeout or magnitude limit.
-"""
+"""ROS 2 ODrive driver: SI commands, selected telemetry, mode services."""
 
 import json
 import math
-import queue
 import re
 import threading
 import time
@@ -34,7 +11,6 @@ from dataclasses import dataclass, field
 
 import odrive
 import odrive.enums as enums
-
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -47,17 +23,17 @@ from std_srvs.srv import Trigger
 PATH = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*")
 
 MODES = {
-    "position": ("CONTROL_MODE_POSITION_CONTROL", "input_pos", math.tau, "rad"),
-    "velocity": ("CONTROL_MODE_VELOCITY_CONTROL", "input_vel", math.tau, "rad/s"),
-    "torque": ("CONTROL_MODE_TORQUE_CONTROL", "input_torque", 1.0, "N*m"),
+    "position": ("CONTROL_MODE_POSITION_CONTROL", "input_pos", math.tau),
+    "velocity": ("CONTROL_MODE_VELOCITY_CONTROL", "input_vel", math.tau),
+    "torque": ("CONTROL_MODE_TORQUE_CONTROL", "input_torque", 1.0),
 }
 
 INPUTS = {
-    "passthrough": ("PASSTHROUGH", {"position", "velocity", "torque"}),
-    "velocity_ramp": ("VEL_RAMP", {"velocity"}),
-    "position_filter": ("POS_FILTER", {"position"}),
-    "trajectory": ("TRAP_TRAJ", {"position"}),
-    "torque_ramp": ("TORQUE_RAMP", {"torque"}),
+    "passthrough": ("INPUT_MODE_PASSTHROUGH", {"position", "velocity", "torque"}),
+    "velocity_ramp": ("INPUT_MODE_VEL_RAMP", {"velocity"}),
+    "trajectory": ("INPUT_MODE_TRAP_TRAJ", {"position"}),
+    "torque_ramp": ("INPUT_MODE_TORQUE_RAMP", {"torque"}),
+    "position_filter": ("INPUT_MODE_POS_FILTER", {"position"}),
 }
 
 UNIT_RULES = {
@@ -102,34 +78,83 @@ def finite(value):
     return float(value)
 
 
+def unit_key(path):
+    parts = path.split(".")
+    return ".".join(parts[1:]) if parts[0] in ("axis0", "axis1") else path
+
+
 def resolve(root, path):
     if not isinstance(path, str) or not PATH.fullmatch(path):
-        raise ValueError("Invalid dotted property path")
+        raise ValueError("Invalid property path")
     parts = path.split(".")
     for part in parts[:-1]:
         root = getattr(root, part)
     return root, parts[-1]
 
 
-def unit_key(path):
-    parts = path.split(".")
-    return ".".join(parts[1:]) if parts[0] in ("axis0", "axis1") else path
+@dataclass
+class Job:
+    action: str
+    done: threading.Event = field(default_factory=threading.Event)
+    success: bool = False
+    message: str = ""
 
 
-def input_enum(name):
-    # Legacy odrive.enums exposes INPUT_MODE_* constants.
-    symbol = "INPUT_MODE_" + INPUTS[name][0]
-    if not hasattr(enums, symbol):
-        raise ValueError(f"Installed odrive library does not expose {symbol}")
-    return getattr(enums, symbol)
+class USBWorker:
+    """Only this thread accesses the ODrive connection."""
 
+    def __init__(self, params, notify, logger):
+        self.params = params
+        self.notify = notify
+        self.logger = logger
 
-class USBBackend:
-    """Constructed and used exclusively by USBWorker."""
+        self.condition = threading.Condition()
+        self.stopping = False
+        self.ready = False
+        self.fault = None
+        self.transitioning = False
 
-    def __init__(self, params):
+        self.target = None
+        self.jobs = deque()
+        self.output = None
+
+        self.thread = threading.Thread(
+            target=self.run, name="odrive_usb", daemon=True
+        )
+
+    def command(self, value):
+        with self.condition:
+            if self.ready and not self.stopping and not self.transitioning:
+                self.target = value
+                self.condition.notify()
+
+    def submit(self, action):
+        job = Job(action)
+        with self.condition:
+            if not self.ready or self.stopping:
+                raise RuntimeError(self.fault or "USB worker not ready")
+            if len(self.jobs) >= 8:
+                raise RuntimeError("Service queue full")
+
+            # Discard the old setpoint before every explicit transition.
+            self.transitioning = True
+            self.target = None
+            if action == "idle":
+                self.jobs.appendleft(job)
+            else:
+                self.jobs.append(job)
+            self.condition.notify()
+        return job
+
+    def take_output(self):
+        with self.condition:
+            result = self.output
+            self.output = None
+        return result
+
+    def configure_telemetry(self):
         self.units = dict(UNIT_RULES)
-        extensions = json.loads(params["unit_rules_json"])
+        extensions = json.loads(self.params["unit_rules_json"])
         if not isinstance(extensions, dict):
             raise ValueError("unit_rules_json must be an object")
 
@@ -138,401 +163,281 @@ class USBBackend:
                 raise ValueError("Invalid unit-rule path")
             key = unit_key(path)
             if key in self.units:
-                raise ValueError(f"Cannot override built-in unit rule: {path}")
+                raise ValueError(f"Cannot override built-in rule: {key}")
             factor = finite(rule["native_to_si"])
             unit = rule["unit"]
             if factor <= 0 or not isinstance(unit, str) or not unit:
                 raise ValueError("Expected positive factor and nonempty unit")
             self.units[key] = (factor, unit)
 
-        self.device = odrive.find_any(
-            serial_number=params["serial_number"] or None,
-            timeout=params["connect_timeout_s"],
-        )
-        self.axis = getattr(self.device, f"axis{params['axis']}")
-        self.controller = self.axis.controller
-        self.serial = f"{self.device.serial_number:X}"
-
-        # Discover actual configuration; do not modify it on connection.
-        self.mode = self.read_mode()
-        self.input_mode = self.read_input_mode()
-
-        spec = json.loads(params["telemetry_json"])
+        spec = json.loads(self.params["telemetry_json"])
         if not isinstance(spec, dict):
             raise ValueError("telemetry_json must be an object")
+
         self.telemetry = []
         for alias, item in spec.items():
-            if "scale" in item:
-                raise ValueError("Use unit_rules_json instead of telemetry scale")
+            if not isinstance(item, dict) or "scale" in item:
+                raise ValueError("Invalid telemetry entry; use unit_rules_json")
             scope = item.get("scope", "axis")
             if scope not in ("axis", "device"):
                 raise ValueError("Telemetry scope must be axis or device")
             path = item["path"]
             root = self.axis if scope == "axis" else self.device
             parent, name = resolve(root, path)
-            self.to_si(path, getattr(parent, name))
+            value = getattr(parent, name)
+            self.to_si(path, value)
             self.telemetry.append((alias, parent, name, path))
+
+    def to_si(self, path, value):
+        if type(value) is bool:
+            return {"value": value, "unit": "bool"}
+        if type(value) is str:
+            return {"value": value, "unit": "string"}
+        if type(value) not in (int, float):
+            raise ValueError(f"Non-scalar telemetry: {path}")
+
+        key = unit_key(path)
+        if key not in self.units:
+            raise ValueError(f"Register {path} in unit_rules_json")
+        factor, unit = self.units[key]
+        converted = value if factor == 1.0 else value * factor
+        if isinstance(converted, float) and not math.isfinite(converted):
+            converted = str(converted)
+        return {"value": converted, "unit": unit}
 
     def read_mode(self):
         actual = self.controller.config.control_mode
-        for name, (symbol, _, _, _) in MODES.items():
+        for name, (symbol, _, _) in MODES.items():
             if actual == getattr(enums, symbol):
                 return name
-        raise ValueError(f"Unsupported device control mode: {actual}")
+        raise ValueError(f"Unsupported control mode: {actual}")
 
-    def read_input_mode(self):
-        actual = self.controller.config.input_mode
-        for name in INPUTS:
-            try:
-                if actual == input_enum(name):
-                    return name
-            except ValueError:
-                pass
-        return "unsupported"
-
-    def rule(self, path, value):
-        if type(value) is bool:
-            return 1.0, "bool"
-        if type(value) is str:
-            return 1.0, "string"
-        if type(value) not in (int, float):
-            raise ValueError("Only scalar properties are supported")
-        key = unit_key(path)
-        if key not in self.units:
-            raise ValueError(f"Register {path} in unit_rules_json first")
-        return self.units[key]
-
-    def to_si(self, path, value):
-        factor, unit = self.rule(path, value)
-        if type(value) in (int, float):
-            value = value if factor == 1.0 else value * factor
-            if type(value) is float and not math.isfinite(value):
-                value = str(value)
-        return {"value": value, "unit": unit}
-
-    def require_idle(self):
+    def set_mode(self, mode, shaping):
         if self.axis.current_state != enums.AXIS_STATE_IDLE:
             raise RuntimeError("Axis must be IDLE")
-
-    def set_mode(self, mode, shaping="passthrough"):
-        self.require_idle()
-        if mode not in MODES or shaping not in INPUTS:
-            raise ValueError("Unknown control or input mode")
         if mode not in INPUTS[shaping][1]:
-            raise ValueError(f"{shaping} is incompatible with {mode}")
+            raise ValueError("Incompatible control/input mode")
 
         control = getattr(enums, MODES[mode][0])
-        input_value = input_enum(shaping)
+        input_mode = getattr(enums, INPUTS[shaping][0])
 
-        # Clear feedforward and initialize position at the current angle.
-        # These writes happen only on explicit mode selection, while IDLE.
         position = self.axis.encoder.pos_estimate
         self.controller.input_vel = 0.0
         self.controller.input_torque = 0.0
         self.controller.input_pos = position
         self.controller.config.control_mode = control
-        self.controller.config.input_mode = input_value
+        self.controller.config.input_mode = input_mode
 
-        # Read back rather than assuming configuration writes succeeded.
         self.mode = self.read_mode()
-        self.input_mode = self.read_input_mode()
-        if self.mode != mode or self.input_mode != shaping:
-            raise RuntimeError("Mode configuration readback mismatch")
-        return {"mode": self.mode, "input_mode": self.input_mode}
+        actual_input = self.controller.config.input_mode
+        if self.mode != mode or actual_input != input_mode:
+            raise RuntimeError("Mode readback mismatch")
+        return f"mode={mode}, input={shaping}"
 
-    def command(self, value):
-        _, name, factor, _ = MODES[self.mode]
-        setattr(self.controller, name, value / factor)
-
-    def status(self):
-        return {
-            "serial": self.serial,
-            "mode": self.mode,
-            "input_mode": self.input_mode,
-            "command_unit": MODES[self.mode][3],
-            "state": self.axis.current_state,
-            "errors": {
-                "axis": self.axis.error,
-                "motor": self.axis.motor.error,
-                "encoder": self.axis.encoder.error,
-                "controller": self.controller.error,
-            },
-        }
-
-    def set_config(self, path, value):
-        if not isinstance(path, str) or not PATH.fullmatch(path):
-            raise ValueError("Invalid path")
-        parts = path.split(".")
-        if "config" not in parts[:-1]:
-            raise ValueError("set supports configuration properties only")
-
-        # Keep cached command semantics synchronized through set_mode only.
-        key = unit_key(path)
-        if key in (
-            "controller.config.control_mode",
-            "controller.config.input_mode",
-        ):
-            raise ValueError("Use set_mode or the mode-selection services")
-
-        affected = (
-            (parts[0],) if parts[0] in ("axis0", "axis1")
-            else ("axis0", "axis1")
-        )
-        for name in affected:
-            axis = getattr(self.device, name, None)
-            if axis is not None and axis.current_state != enums.AXIS_STATE_IDLE:
-                raise RuntimeError(f"{name} must be IDLE")
-
-        parent, name = resolve(self.device, path)
-        old = getattr(parent, name)
-        factor, unit = self.rule(path, old)
-        if type(old) is bool:
-            if type(value) is not bool:
-                raise ValueError("Expected boolean")
-            native = value
-        elif type(old) is str:
-            if type(value) is not str:
-                raise ValueError("Expected string")
-            native = value
-        else:
-            if isinstance(value, str) and unit == "enum":
-                value = getattr(enums, value)
-            native = finite(value) / factor
-            if type(old) is int:
-                if not native.is_integer():
-                    raise ValueError("Expected integer after SI conversion")
-                native = int(native)
-
-        setattr(parent, name, native)
-        actual = getattr(parent, name)
-        verified = (
-            math.isclose(actual, native, rel_tol=1e-5, abs_tol=1e-7)
-            if type(native) is float else actual == native
-        )
-        return {
-            **self.to_si(path, actual),
-            "verified": verified,
-            "persistent": False,
-        }
-
-    def execute(self, request):
-        op = request["op"]
-        if op == "idle":
+    def execute(self, action):
+        if action == "idle":
             self.axis.requested_state = enums.AXIS_STATE_IDLE
-            return {"requested": "IDLE"}
+            return "IDLE requested"
 
-        if op == "closed_loop":
+        if action == "closed_loop":
+            # Do not intentionally re-enable with a stale velocity/torque.
+            if self.axis.current_state != enums.AXIS_STATE_IDLE:
+                raise RuntimeError("Axis must be IDLE before enabling")
+            self.controller.input_vel = 0.0
+            self.controller.input_torque = 0.0
+            self.controller.input_pos = self.axis.encoder.pos_estimate
             self.axis.requested_state = enums.AXIS_STATE_CLOSED_LOOP_CONTROL
-            return {"requested": "CLOSED_LOOP_CONTROL"}
+            return "CLOSED_LOOP_CONTROL requested"
 
-        if op == "set_mode":
-            return self.set_mode(
-                request["mode"], request.get("input_mode", "passthrough")
-            )
+        if action in MODES:
+            return self.set_mode(action, "passthrough")
 
-        if op == "set_input":
-            return self.set_mode(self.mode, request["input_mode"])
-
-        if op == "ramped":
+        if action == "ramped":
             shaping = {
                 "position": "trajectory",
                 "velocity": "velocity_ramp",
                 "torque": "torque_ramp",
             }[self.mode]
-            return self.set_mode(self.mode, shaping)
+        else:
+            shaping = action
+        return self.set_mode(self.mode, shaping)
 
-        if op == "move_relative":
-            if self.mode != "position" or self.input_mode != "trajectory":
-                raise RuntimeError("Relative moves require position/trajectory")
-            value = finite(request["value"])
-            from_goal = request.get("from_goal", False)
-            if type(from_goal) is not bool:
-                raise ValueError("from_goal must be boolean")
-            move = getattr(self.controller, "move_incremental", None)
-            if not callable(move):
-                raise RuntimeError("Device does not expose move_incremental")
-            move(value / math.tau, from_goal)
-            return {"increment_rad": value, "from_goal": from_goal}
+    def write_due_command(self):
+        now = time.monotonic()
+        if now < self.command_due:
+            return
 
-        if op == "status":
-            return self.status()
+        with self.condition:
+            value = None if self.transitioning else self.target
 
-        if op == "get":
-            path = request["path"]
-            parent, name = resolve(self.device, path)
-            return self.to_si(path, getattr(parent, name))
+        if value is not None:
+            _, name, factor = MODES[self.mode]
+            setattr(self.controller, name, value / factor)
 
-        if op == "set":
-            return self.set_config(request["path"], request["value"])
-
-        raise ValueError(f"Unsupported operation: {op}")
-
-    def sample(self):
-        began = time.monotonic()
-        values = {
-            alias: self.to_si(path, getattr(parent, name))
-            for alias, parent, name, path in self.telemetry
-        }
-        state = self.axis.current_state
-        error = self.axis.error
+        # Skip missed slots instead of sending catch-up bursts.
         finished = time.monotonic()
-        return {
-            "monotonic_s": finished,
-            "read_duration_s": finished - began,
-            "mode": self.mode,
-            "input_mode": self.input_mode,
-            "command_unit": MODES[self.mode][3],
-            "state": state,
-            "axis_error": error,
-            "values": values,
+        slots = max(
+            1, int((finished - self.command_due) / self.command_period) + 1
+        )
+        self.command_due += slots * self.command_period
+
+    def clear_startup_errors(self):
+        # All device access stays inside the USB worker thread.
+        self.axis.requested_state = enums.AXIS_STATE_IDLE
+        deadline = time.monotonic() + 2.0
+
+        while self.axis.current_state != enums.AXIS_STATE_IDLE:
+            if self.stopping:
+                raise RuntimeError("Shutdown during startup")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Startup: IDLE not confirmed; errors not cleared")
+            time.sleep(0.02)
+
+        error_objects = (
+            ("axis", self.axis),
+            ("motor", self.axis.motor),
+            ("encoder", self.axis.encoder),
+            ("controller", self.axis.controller),
+        )
+
+        before = {
+            name: int(obj.error) for name, obj in error_objects
         }
+        self.logger.info(
+            "Startup errors before clear: "
+            + ", ".join(f"{name}=0x{value:X}" for name, value in before.items())
+        )
 
+        for _, obj in error_objects:
+            obj.error = 0
 
-@dataclass
-class Job:
-    request: dict
-    service: bool = False
-    done: threading.Event = field(default_factory=threading.Event)
-    result: dict = field(default_factory=dict)
+        after = {
+            name: int(obj.error) for name, obj in error_objects
+        }
+        self.logger.info(
+            "Startup errors after clear: "
+            + ", ".join(f"{name}=0x{value:X}" for name, value in after.items())
+        )
 
+        if any(after.values()):
+            raise RuntimeError("Startup: errors remain after clear")
 
-class USBWorker:
-    """Only this object's thread may access USBBackend."""
-
-    def __init__(self, params, logger):
-        self.params = params
-        self.logger = logger
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.jobs = deque()
-        self.responses = queue.SimpleQueue()
-        self.pending = None
-        self.feedback = None
-        self.ready = False
-        self.fault = None
-        self.thread = threading.Thread(target=self.run, daemon=True)
-
-    def submit(self, request, service=False):
-        job = Job(request, service)
-        with self.lock:
-            if self.fault:
-                raise RuntimeError(self.fault)
-            if not self.ready or self.stop.is_set():
-                raise RuntimeError("USB worker is not ready")
-            if len(self.jobs) >= 32:
-                raise RuntimeError("Administrative queue is full")
-            if request.get("op") == "idle":
-                self.pending = None
-                self.jobs.appendleft(job)
-            else:
-                self.jobs.append(job)
-        return job
-
-    def command(self, value):
-        with self.lock:
-            if self.fault:
-                raise RuntimeError(self.fault)
-            if not self.ready or self.stop.is_set():
-                raise RuntimeError("USB worker is not ready")
-            self.pending = value
-
-    def complete(self, job, ok, **data):
-        job.result = {"id": job.request.get("id"), "ok": ok, **data}
-        if not job.service:
-            self.responses.put(job.result)
-        job.done.set()
+        self.logger.info("Startup: errors cleared; axis left in IDLE")
 
     def run(self):
-        backend = None
-        current = None
+        self.device = None
+        active_job = None
         try:
-            self.logger.info("Connecting to ODrive...")
-            backend = USBBackend(self.params)
-            with self.lock:
-                self.ready = True
-            self.logger.info(
-                f"Connected {backend.serial}; "
-                f"mode={backend.mode}; input={backend.input_mode}"
+            self.device = odrive.find_any(
+                serial_number=self.params["serial_number"] or None,
+                timeout=self.params["connect_timeout_s"],
             )
+            self.axis = getattr(self.device, f"axis{self.params['axis']}")
+            self.controller = self.axis.controller
+            self.clear_startup_errors()
+            self.mode = self.read_mode()
+            self.configure_telemetry()
 
-            period = 1.0 / self.params["rate_hz"]
-            deadline = time.monotonic()
-            cycles = overruns = 0
-            max_work = 0.0
+            self.command_period = 1.0 / self.params["rate_hz"]
+            telemetry_period = 1.0 / self.params["telemetry_hz"]
+            self.command_due = time.monotonic()
+            telemetry_due = self.command_due
 
-            while not self.stop.is_set():
-                began = time.monotonic()
-                with self.lock:
-                    current = self.jobs.popleft() if self.jobs else None
-                    command = self.pending
-                    self.pending = None
+            values = {}
+            index = 0
+            sampling = False
 
-                # Administrative transitions form a command barrier.
-                # Do not reinterpret an old float after changing its units.
-                barrier = current is not None and current.request["op"] in (
-                    "idle", "set_mode", "set_input", "ramped", "move_relative"
-                )
+            with self.condition:
+                self.ready = True
+            self.logger.info("ODrive connected")
 
-                if command is not None and not barrier:
-                    backend.command(command)
+            while True:
+                with self.condition:
+                    if self.stopping:
+                        break
+                    active_job = self.jobs.popleft() if self.jobs else None
 
-                if current is not None:
+                if active_job is not None:
                     try:
-                        result = backend.execute(current.request)
-                        self.complete(current, True, result=result)
+                        active_job.message = self.execute(active_job.action)
+                        active_job.success = True
                     except Exception as exc:
-                        self.complete(current, False, error=str(exc))
+                        active_job.message = str(exc)
                     finally:
-                        if barrier:
-                            with self.lock:
-                                self.pending = None
-                        current = None
+                        with self.condition:
+                            self.target = None
+                            self.transitioning = bool(self.jobs)
+                        active_job.done.set()
+                        active_job = None
+                    # Do not mix samples from before and after a transition.
+                    sampling = False
+                    values = {}
+                    continue
 
-                snapshot = backend.sample()
-                work = time.monotonic() - began
-                cycles += 1
-                overruns += int(work > period)
-                max_work = max(max_work, work)
-                snapshot["timing"] = {
-                    "cycles": cycles,
-                    "work_s": work,
-                    "max_work_s": max_work,
-                    "work_overruns": overruns,
-                }
-                with self.lock:
-                    self.feedback = snapshot
-
-                deadline += period
+                self.write_due_command()
                 now = time.monotonic()
-                if deadline < now:
-                    deadline = now
-                self.stop.wait(max(0.0, deadline - now))
+
+                if not sampling and now >= telemetry_due:
+                    slots = max(
+                        1, int((now - telemetry_due) / telemetry_period) + 1
+                    )
+                    telemetry_due += slots * telemetry_period
+                    values = {}
+                    index = 0
+                    sampling = bool(self.telemetry)
+
+                if sampling:
+                    # One synchronous read, then reconsider command deadline.
+                    alias, parent, name, path = self.telemetry[index]
+                    value = getattr(parent, name)
+                    values[alias] = self.to_si(path, value)
+                    index += 1
+
+                    self.write_due_command()
+
+                    if index == len(self.telemetry):
+                        with self.condition:
+                            self.output = values
+                        self.notify()
+                        sampling = False
+                    continue
+
+                deadline = min(self.command_due, telemetry_due)
+                with self.condition:
+                    if not self.stopping and not self.jobs:
+                        self.condition.wait(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
 
         except Exception as exc:
-            with self.lock:
-                self.fault = f"{type(exc).__name__}: {exc}"
-            self.logger.error(f"USB worker stopped: {self.fault}")
+            self.fault = f"{type(exc).__name__}: {exc}"
+            self.logger.error(f"USB stopped: {self.fault}")
 
         finally:
-            with self.lock:
+            with self.condition:
                 self.ready = False
+                self.target = None
                 remaining = list(self.jobs)
                 self.jobs.clear()
-                reason = self.fault or "USB worker stopped"
-            if current is not None and not current.done.is_set():
-                self.complete(current, False, error=reason)
+
+            if active_job is not None:
+                remaining.insert(0, active_job)
             for job in remaining:
-                self.complete(job, False, error=reason)
-            if backend is not None:
+                job.success = False
+                job.message = self.fault or "USB worker stopped"
+                job.done.set()
+
+            if self.device is not None and hasattr(self, "axis"):
                 try:
-                    backend.execute({"op": "idle"})
+                    self.axis.requested_state = enums.AXIS_STATE_IDLE
                 except Exception as exc:
-                    self.logger.error(
-                        f"Shutdown IDLE failed: {exc}; use independent stop"
-                    )
+                    self.logger.error(f"Shutdown IDLE failed: {exc}")
 
     def close(self):
-        self.stop.set()
+        with self.condition:
+            self.stopping = True
+            self.target = None
+            self.condition.notify_all()
         self.thread.join()
 
 
@@ -543,12 +448,19 @@ class ODriveDriver(Node):
             "serial_number": "",
             "axis": 0,
             "connect_timeout_s": 20.0,
-            "rate_hz": 100.0,
-            "log_hz": 1.0,
+            "rate_hz": 500.0,
+            "telemetry_hz": 100.0,
             "unit_rules_json": "{}",
             "telemetry_json": json.dumps({
                 "position_rad": {"path": "encoder.pos_estimate"},
                 "velocity_rad_s": {"path": "encoder.vel_estimate"},
+                "current_limit_a": {"path": "motor.config.current_lim"},
+                "torque_constant_nm_per_a": {
+                    "path": "motor.config.torque_constant"
+                },
+                "velocity_limit_rad_s": {
+                    "path": "controller.config.vel_limit"
+                },
             }),
         }
         for name, value in defaults.items():
@@ -556,114 +468,80 @@ class ODriveDriver(Node):
         params = {
             name: self.get_parameter(name).value for name in defaults
         }
-        params["rate_hz"] = finite(params["rate_hz"])
-        params["connect_timeout_s"] = finite(params["connect_timeout_s"])
-        self.log_hz = finite(params["log_hz"])
-        if params["axis"] not in (0, 1):
+
+        for name in ("rate_hz", "telemetry_hz", "connect_timeout_s"):
+            params[name] = finite(params[name])
+            if params[name] <= 0:
+                raise ValueError(f"{name} must be positive")
+        if type(params["axis"]) is not int or params["axis"] not in (0, 1):
             raise ValueError("axis must be 0 or 1")
-        if (
-            params["rate_hz"] <= 0
-            or params["connect_timeout_s"] <= 0
-            or self.log_hz < 0
-        ):
-            raise ValueError("Invalid rate or timeout")
+
+        self.command_group = MutuallyExclusiveCallbackGroup()
+        self.service_group = MutuallyExclusiveCallbackGroup()
+        self.publish_group = MutuallyExclusiveCallbackGroup()
 
         latest = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.BEST_EFFORT
         )
-        self.response_pub = self.create_publisher(String, "~/response", 32)
         self.feedback_pub = self.create_publisher(String, "~/feedback", latest)
-        self.create_subscription(Float64, "~/command", self.on_command, latest)
-        self.create_subscription(String, "~/request", self.on_request, 32)
+        self.feedback_guard = self.create_guard_condition(
+            self.publish_feedback, callback_group=self.publish_group
+        )
+        self.worker = USBWorker(
+            params, self.feedback_guard.trigger, self.get_logger()
+        )
+        self.command_sub = self.create_subscription(
+            Float64, "~/command", self.on_command, latest,
+            callback_group=self.command_group,
+        )
 
-        # Service waiting cannot block command reception/publication.
-        # Only one administrative service callback waits at a time.
-        self.service_group = MutuallyExclusiveCallbackGroup()
-        self._driver_services = []
         actions = {
-            "set_idle": {"op": "idle"},
-            "set_closed_loop": {"op": "closed_loop"},
-            "set_vel_mode": {"op": "set_mode", "mode": "velocity"},
-            "set_position_mode": {"op": "set_mode", "mode": "position"},
-            "set_torque_mode": {"op": "set_mode", "mode": "torque"},
-            "set_passthrough": {
-                "op": "set_input", "input_mode": "passthrough"
-            },
-            "set_ramped": {"op": "ramped"},
-            "set_position_filter": {
-                "op": "set_input", "input_mode": "position_filter"
-            },
-            "get_status": {"op": "status"},
+            "set_idle": "idle",
+            "set_closed_loop": "closed_loop",
+            "set_vel_mode": "velocity",
+            "set_position_mode": "position",
+            "set_torque_mode": "torque",
+            "set_passthrough": "passthrough",
+            "set_ramped": "ramped",
+            "set_position_filter": "position_filter",
         }
-        for name, action in actions.items():
-            self._driver_services.append(self.create_service(
-                Trigger, "~/" + name, self.service_callback(action),
+        self._driver_services = [
+            self.create_service(
+                Trigger, "~/" + name, self.make_service(action),
                 callback_group=self.service_group,
-            ))
-
-        self.last_stamp = None
-        self.last_log = 0.0
-        self.worker = USBWorker(params, self.get_logger())
-        self.create_timer(1.0 / params["rate_hz"], self.publish_cached)
+            )
+            for name, action in actions.items()
+        ]
         self.worker.thread.start()
 
-    def service_callback(self, action):
+    def on_command(self, message):
+        # Ignore invalid commands without flooding logs at command rate.
+        if math.isfinite(message.data):
+            self.worker.command(message.data)
+
+    def make_service(self, action):
         def callback(request, response):
             try:
-                job = self.worker.submit(dict(action), service=True)
-                # Worker completion includes USB execution, not just queuing.
-                job.done.wait()
-                response.success = job.result["ok"]
-                response.message = json.dumps(job.result, allow_nan=False)
+                job = self.worker.submit(action)
+                while not job.done.wait(0.1):
+                    if not rclpy.ok():
+                        response.success = False
+                        response.message = "ROS shutdown; state not confirmed"
+                        return response
+                response.success = job.success
+                response.message = job.message
             except Exception as exc:
                 response.success = False
                 response.message = str(exc)
             return response
         return callback
 
-    def on_command(self, message):
-        try:
-            self.worker.command(finite(message.data))
-        except Exception as exc:
-            self.get_logger().error(f"Command rejected: {exc}")
-
-    def on_request(self, message):
-        request = {}
-        try:
-            request = json.loads(message.data)
-            if not isinstance(request, dict) or not isinstance(request.get("op"), str):
-                raise ValueError("Expected a JSON object with string op")
-            self.worker.submit(request)
-        except Exception as exc:
-            self.worker.responses.put({
-                "id": request.get("id") if isinstance(request, dict) else None,
-                "ok": False,
-                "error": str(exc),
-            })
-
-    @staticmethod
-    def publish_json(publisher, value):
-        publisher.publish(String(data=json.dumps(value, allow_nan=False)))
-
-    def publish_cached(self):
-        for _ in range(32):
-            try:
-                response = self.worker.responses.get_nowait()
-            except queue.Empty:
-                break
-            self.publish_json(self.response_pub, response)
-
-        with self.worker.lock:
-            snapshot = self.worker.feedback
-        if snapshot is None or snapshot["monotonic_s"] == self.last_stamp:
-            return
-
-        self.last_stamp = snapshot["monotonic_s"]
-        self.publish_json(self.feedback_pub, snapshot)
-        now = time.monotonic()
-        if self.log_hz and now - self.last_log >= 1.0 / self.log_hz:
-            self.last_log = now
-            self.get_logger().info(json.dumps(snapshot, allow_nan=False))
+    def publish_feedback(self):
+        values = self.worker.take_output()
+        if values is not None:
+            self.feedback_pub.publish(
+                String(data=json.dumps(values, allow_nan=False))
+            )
 
 
 def main(args=None):

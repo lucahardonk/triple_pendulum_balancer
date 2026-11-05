@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>pendulum_bringup</name>
+  <version>0.0.0</version>
+  <description>Launch files for pendulum hardware infrastructure</description>
+  <maintainer email="YOUR_EMAIL@example.com">lucahardonk</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>odrive_driver</exec_depend>
+  <exec_depend>joy</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

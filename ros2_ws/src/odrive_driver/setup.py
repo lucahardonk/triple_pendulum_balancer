@@ -13,7 +13,7 @@ setup(
         ),
         (
             'share/' + package_name,
-            ['package.xml', 'README.md'],
+            ['package.xml'],
         ),
     ],
     package_data={'': ['py.typed']},
