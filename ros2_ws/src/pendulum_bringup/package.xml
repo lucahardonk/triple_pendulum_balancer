@@ -10,7 +10,7 @@
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <exec_depend>odrive_driver</exec_depend>
+  <exec_depend>odrive_can</exec_depend>
   <exec_depend>joy</exec_depend>
 
   <export>

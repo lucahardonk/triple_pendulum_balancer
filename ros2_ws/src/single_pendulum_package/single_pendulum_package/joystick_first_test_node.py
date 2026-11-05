@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Joystick velocity/torque test bridge for the ODrive driver."""
+"""Joystick velocity/torque test bridge for the ODrive CAN driver (odrive_can)."""
 
 import math
 
+from odrive_can.msg import ControlMessage
+from odrive_can.srv import AxisState
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Joy
-from std_msgs.msg import Float64
-from std_srvs.srv import Trigger
+
+AXIS_STATE_IDLE = 1
+AXIS_STATE_CLOSED_LOOP = 8
+CONTROL_MODE = {"torque": 1, "velocity": 2}
+INPUT_MODE_PASSTHROUGH = 1
+STATE_NAMES = {AXIS_STATE_IDLE: "IDLE", AXIS_STATE_CLOSED_LOOP: "CLOSED_LOOP"}
 
 
 class JoystickFirstTest(Node):
@@ -41,22 +47,17 @@ class JoystickFirstTest(Node):
         self.joy_seen = False
         self.invalid_joy_reported = False
 
+        # odrive_can subscribes with a reliable QoS: publish reliable.
         self.publisher = self.create_publisher(
-            Float64, "/odrive_driver/command", qos_profile_sensor_data
+            ControlMessage, "/odrive_axis0/control_message", 10
         )
         self.subscription = self.create_subscription(
             Joy, "/joy", self.on_joy, qos_profile_sensor_data
         )
 
-        self._service_clients = {
-            name: self.create_client(Trigger, f"/odrive_driver/{name}")
-            for name in (
-                "set_idle",
-                "set_closed_loop",
-                "set_vel_mode",
-                "set_torque_mode",
-            )
-        }
+        self.axis_client = self.create_client(
+            AxisState, "/odrive_axis0/request_axis_state"
+        )
 
         self.timer = self.create_timer(0.01, self.publish_command)
 
@@ -133,8 +134,19 @@ class JoystickFirstTest(Node):
         elif pressed[3]:
             self.request_closed_loop(valid_axis)
 
+    def send(self, mode, value):
+        msg = ControlMessage(
+            control_mode=CONTROL_MODE[mode],
+            input_mode=INPUT_MODE_PASSTHROUGH,
+        )
+        if mode == "velocity":
+            msg.input_vel = value / math.tau  # rad/s -> giri/s
+        else:
+            msg.input_torque = value  # N*m
+        self.publisher.publish(msg)
+
     def send_zero(self):
-        self.publisher.publish(Float64(data=0.0))
+        self.send(self.mode or "velocity", 0.0)
 
     def request_idle(self):
         self.enabled = False
@@ -148,13 +160,12 @@ class JoystickFirstTest(Node):
             )
             return
 
-        self.call_service("set_idle", self.on_idle_success)
+        self.call_service(AXIS_STATE_IDLE, self.on_idle_success)
 
     def on_idle_success(self):
         self.idle_acknowledged = True
         self.get_logger().info(
-            "Richiesta IDLE accettata; invio disabilitato. "
-            "Lo stato fisico non e verificato da questo bridge."
+            "IDLE confermato dall'heartbeat; invio disabilitato."
         )
 
     def select_mode(self, mode):
@@ -164,18 +175,15 @@ class JoystickFirstTest(Node):
             )
             return
 
-        self.mode = None
-        service = "set_vel_mode" if mode == "velocity" else "set_torque_mode"
-
-        def success():
-            self.mode = mode
-            unit = "rad/s" if mode == "velocity" else "N*m"
-            self.get_logger().info(
-                f"Modalita selezionata: {mode}, comandi in {unit}. "
-                "Centrare lo stick e premere 3."
-            )
-
-        self.call_service(service, success)
+        # With odrive_can the control mode travels with every setpoint:
+        # a zero setpoint while IDLE configures the mode on the ODrive.
+        self.mode = mode
+        self.send_zero()
+        unit = "rad/s" if mode == "velocity" else "N*m"
+        self.get_logger().info(
+            f"Modalita selezionata: {mode}, comandi in {unit}. "
+            "Centrare lo stick e premere 3."
+        )
 
     def request_closed_loop(self, valid_axis):
         if self.enabled:
@@ -194,7 +202,8 @@ class JoystickFirstTest(Node):
             )
             return
 
-        self.call_service("set_closed_loop", self.on_closed_loop_success)
+        self.send_zero()
+        self.call_service(AXIS_STATE_CLOSED_LOOP, self.on_closed_loop_success)
 
     def on_closed_loop_success(self):
         # Stick may have moved while the service was pending.
@@ -208,15 +217,15 @@ class JoystickFirstTest(Node):
         self.idle_acknowledged = False
         self.enabled = True
         self.get_logger().info(
-            "Richiesta CLOSED-LOOP accettata, invio a 100 Hz abilitato. "
-            "Il raggiungimento dello stato non e verificato."
+            "CLOSED-LOOP confermato dall'heartbeat, invio a 100 Hz abilitato."
         )
 
-    def call_service(self, name, on_success):
-        client = self._service_clients[name]
-        if not client.service_is_ready():
+    def call_service(self, state, on_success):
+        name = STATE_NAMES[state]
+        if not self.axis_client.service_is_ready():
             self.get_logger().error(
-                f"Servizio /odrive_driver/{name} non disponibile; ripremere"
+                "Servizio /odrive_axis0/request_axis_state non disponibile; "
+                "ripremere"
             )
             return
 
@@ -224,7 +233,9 @@ class JoystickFirstTest(Node):
         self.get_logger().info(f"Richiesta: {name}")
 
         try:
-            future = client.call_async(Trigger.Request())
+            future = self.axis_client.call_async(
+                AxisState.Request(axis_requested_state=state)
+            )
         except Exception as exc:
             self.busy = False
             self.get_logger().error(f"{name}: {exc}")
@@ -233,14 +244,16 @@ class JoystickFirstTest(Node):
         def done(result_future):
             try:
                 result = result_future.result()
-                if result.success:
-                    self.get_logger().info(f"{name}: OK | {result.message}")
+                info = (
+                    f"axis_state={result.axis_state}, "
+                    f"errori=0x{result.active_errors:X}"
+                )
+                if result.axis_state == state:
+                    self.get_logger().info(f"{name}: OK | {info}")
                     if not self.pending_idle:
                         on_success()
                 else:
-                    self.get_logger().error(
-                        f"{name}: FALLITO | {result.message}"
-                    )
+                    self.get_logger().error(f"{name}: FALLITO | {info}")
             except Exception as exc:
                 self.get_logger().error(f"{name}: errore | {exc}")
             finally:
@@ -258,7 +271,7 @@ class JoystickFirstTest(Node):
         scale = (
             self.max_velocity if self.mode == "velocity" else self.max_torque
         )
-        self.publisher.publish(Float64(data=self.axis_value * scale))
+        self.send(self.mode, self.axis_value * scale)
 
 
 def main(args=None):

@@ -1,12 +1,14 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include <nlohmann/json.hpp>
+#include <odrive_can/msg/control_message.hpp>
+#include <odrive_can/msg/controller_status.hpp>
+#include <odrive_can/srv/axis_state.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <stdexcept>
@@ -19,29 +21,28 @@ class OverrunNode : public rclcpp::Node
 {
 public:
   using Trigger = std_srvs::srv::Trigger;
-  using Client = rclcpp::Client<Trigger>;
+  using AxisState = odrive_can::srv::AxisState;
+  using ControlMessage = odrive_can::msg::ControlMessage;
+  using ControllerStatus = odrive_can::msg::ControllerStatus;
+  using Client = rclcpp::Client<AxisState>;
   using Clock = std::chrono::steady_clock;
 
   OverrunNode() : Node("overrun_node")
   {
-    auto qos = rclcpp::QoS(1).best_effort();
-
-    command_pub_ = create_publisher<std_msgs::msg::Float64>(
-      "/odrive_driver/command", qos);
+    // odrive_can subscribes with a reliable QoS: the publisher must be reliable.
+    command_pub_ = create_publisher<ControlMessage>(
+      "/odrive_axis0/control_message", rclcpp::QoS(10));
 
     position_pub_ = create_publisher<std_msgs::msg::Float64>(
       "~/position_rad", 10);
 
-    idle_ = create_client<Trigger>("/odrive_driver/set_idle");
-    velocity_mode_ = create_client<Trigger>(
-      "/odrive_driver/set_vel_mode");
-    enable_ = create_client<Trigger>(
-      "/odrive_driver/set_closed_loop");
+    axis_state_ = create_client<AxisState>(
+      "/odrive_axis0/request_axis_state");
 
-    feedback_sub_ = create_subscription<std_msgs::msg::String>(
-      "/odrive_driver/feedback", qos,
-      [this](std_msgs::msg::String::SharedPtr msg) {
-        feedback(msg->data);
+    feedback_sub_ = create_subscription<ControllerStatus>(
+      "/odrive_axis0/controller_status", rclcpp::QoS(10).best_effort(),
+      [this](ControllerStatus::SharedPtr msg) {
+        feedback(*msg);
       });
 
     stop_service_ = create_service<Trigger>(
@@ -78,28 +79,42 @@ private:
       Clock::now().time_since_epoch()).count();
   }
 
+  // Velocity command in rad/s, sent to the ODrive in turns/s.
   void command(double velocity)
   {
-    std_msgs::msg::Float64 msg;
-    msg.data = velocity;
+    ControlMessage msg;
+    msg.control_mode = kVelocityControl;
+    msg.input_mode = kPassthrough;
+    msg.input_vel = static_cast<float>(velocity / kTau);
+    msg.input_torque = 0.0F;
     command_pub_->publish(msg);
   }
 
-  void call(const Client::SharedPtr & client, State next)
+  static std::shared_ptr<AxisState::Request> request(uint32_t state)
+  {
+    auto req = std::make_shared<AxisState::Request>();
+    req->axis_requested_state = state;
+    return req;
+  }
+
+  void call(uint32_t requested, State next)
   {
     state_ = State::SERVICE;
 
-    client->async_send_request(
-      std::make_shared<Trigger::Request>(),
-      [this, next](Client::SharedFuture future) {
+    axis_state_->async_send_request(
+      request(requested),
+      [this, requested, next](Client::SharedFuture future) {
         if (state_ == State::STOPPED) {
           return;
         }
 
         try {
           const auto response = future.get();
-          if (!response->success) {
-            stop("Driver service failed: " + response->message);
+          if (response->axis_state != requested) {
+            stop(
+              "Axis state " + std::to_string(response->axis_state) +
+              " instead of " + std::to_string(requested) +
+              " (errors 0x" + to_hex(response->active_errors) + ")");
             return;
           }
 
@@ -126,7 +141,14 @@ private:
     RCLCPP_WARN(get_logger(), "%s; requesting IDLE", reason.c_str());
 
     // No braking command: request IDLE directly.
-    idle_->async_send_request(std::make_shared<Trigger::Request>());
+    axis_state_->async_send_request(request(kIdle));
+  }
+
+  static std::string to_hex(uint32_t value)
+  {
+    char buffer[9];
+    std::snprintf(buffer, sizeof(buffer), "%X", value);
+    return buffer;
   }
 
   void start_sweep(State state, double direction)
@@ -143,17 +165,11 @@ private:
       get_logger(), "Sweep: %.3f rad/s", direction_ * speed_);
   }
 
-  void feedback(const std::string & text)
+  void feedback(const ControllerStatus & status)
   {
     try {
-      const auto json = nlohmann::json::parse(text);
-      const auto & p = json.at("position_rad");
-
-      if (p.at("unit").get<std::string>() != "rad") {
-        throw std::runtime_error("Position must be in rad");
-      }
-
-      position_ = p.at("value").get<double>();
+      // odrive_can reports turns: convert to rad.
+      position_ = static_cast<double>(status.pos_estimate) * kTau;
       if (!std::isfinite(position_)) {
         throw std::runtime_error("Invalid position");
       }
@@ -180,7 +196,7 @@ private:
         if (std::abs(error) <= center_tolerance_) {
           command(0.0);
           barriers_active_ = true;
-          call(idle_, State::READY);
+          call(kIdle, State::READY);
         } else {
           command(std::clamp(error, -speed_, speed_));
         }
@@ -271,25 +287,22 @@ private:
   {
     switch (state_) {
       case State::WAITING:
-        if (have_position_ &&
-            idle_->service_is_ready() &&
-            velocity_mode_->service_is_ready() &&
-            enable_->service_is_ready())
-        {
-          call(idle_, State::IDLE_SETTLE);
+        if (have_position_ && axis_state_->service_is_ready()) {
+          call(kIdle, State::IDLE_SETTLE);
         }
         break;
 
       case State::IDLE_SETTLE:
         if (steady() - state_since_ >= 0.2) {
-          // Configure velocity/passthrough while IDLE.
-          call(velocity_mode_, State::ENABLE);
+          // Velocity/passthrough with zero setpoint is set while IDLE.
+          command(0.0);
+          state_ = State::ENABLE;
         }
         break;
 
       case State::ENABLE:
         command(0.0);
-        call(enable_, State::ENABLE_SETTLE);
+        call(kClosedLoop, State::ENABLE_SETTLE);
         break;
 
       case State::ENABLE_SETTLE:
@@ -307,6 +320,12 @@ private:
         break;
     }
   }
+
+  static constexpr uint32_t kIdle = 1;
+  static constexpr uint32_t kClosedLoop = 8;
+  static constexpr uint32_t kVelocityControl = 2;
+  static constexpr uint32_t kPassthrough = 1;
+  static constexpr double kTau = 2.0 * M_PI;
 
   State state_{State::WAITING};
 
@@ -326,10 +345,10 @@ private:
 
   std::deque<std::pair<double, double>> history_;
 
-  Client::SharedPtr idle_, velocity_mode_, enable_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr command_pub_;
+  Client::SharedPtr axis_state_;
+  rclcpp::Publisher<ControlMessage>::SharedPtr command_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr position_pub_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr feedback_sub_;
+  rclcpp::Subscription<ControllerStatus>::SharedPtr feedback_sub_;
   rclcpp::Service<Trigger>::SharedPtr stop_service_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
