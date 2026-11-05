@@ -13,7 +13,7 @@ a robot to balance a homemade triple pendulum for testing control theory algorit
 | `ros2_ws/src/encoders_package` | lettura dei tre encoder del pendolo da ESP32-C6 |
 | `hw_specifications/` | specifiche hardware (driver, motore, ...) |
 | `single_pendulum_test/` | primi test del pendolo singolo (venv `odrive-legacy`) |
-| `odrive-gui-titanium/`, `odrive3.6_web_gui/` | GUI per configurare l'ODrive via USB |
+
 
 > ⚠️ Prima di accendere il motore: **USB dell'ODrive collegata (porta il GND comune) → adattatore CAN → alimentazione motore.**
 > Dettagli in [`ros2_ws/README.md`](ros2_ws/README.md).
