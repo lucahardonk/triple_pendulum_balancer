@@ -9,6 +9,8 @@
 
   <depend>rclpy</depend>
   <depend>odrive_can</depend>
+  <depend>encoders_package</depend>
+  <depend>pendulum_safety_package</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>

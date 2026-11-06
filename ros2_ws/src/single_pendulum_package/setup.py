@@ -25,7 +25,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'joystick_first_test_node = single_pendulum_package.joystick_first_test_node:main'
+            'joystick_first_test_node = single_pendulum_package.joystick_first_test_node:main',
+            'pid_balancer_node = single_pendulum_package.pid_balancer_node:main',
         ],
     },
 )
