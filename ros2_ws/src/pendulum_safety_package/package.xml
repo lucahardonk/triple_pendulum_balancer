@@ -3,7 +3,7 @@
 <package format="3">
   <name>pendulum_safety_package</name>
   <version>0.0.0</version>
-  <description>Calibra la corsa del carrello e pubblica la telemetria in unita SI</description>
+  <description>Calibrazione della corsa, barriere virtuali e mux a priorita' dei comandi ODrive</description>
   <maintainer email="luca.ebay19@gmail.com">lucahardonk</maintainer>
   <license>Apache-2.0</license>
 

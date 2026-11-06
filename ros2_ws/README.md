@@ -48,8 +48,11 @@ source install/setup.bash
 ros2 launch pendulum_bringup hardware.launch.py
 ```
 
-Il launch avvia `odrive_can_node` (namespace `odrive_axis0`, `node_id: 0`, `interface: can0`,
-`legacy_fw05: true`, `poll_rate_hz: 200.0`) e `joy_node`.
+Il launch avvia:
+- `odrive_can_node` (namespace `odrive_axis0`, `node_id: 0`, `interface: can0`, `legacy_fw05: true`, `poll_rate_hz: 200.0`)
+- `control_mux`: unico nodo che comanda il motore (vedi *Mux dei comandi* sotto)
+- `overrun_node`: **all'avvio muove subito il carrello** per calibrare la corsa, tenere libera la guida
+- `joy_node`
 
 ### Build (solo la prima volta o dopo modifiche)
 
@@ -103,6 +106,10 @@ ros2 service call /odrive_axis0/request_axis_state odrive_can/srv/AxisState "{ax
 ```
 
 ### Comandi — topic `/odrive_axis0/control_message` (`odrive_can/msg/ControlMessage`)
+
+> Con `hardware.launch.py` su questo topic pubblica **solo `control_mux`**. Gli altri nodi pubblicano
+> lo stesso messaggio sul proprio ingresso del mux (`/control/safety`, `/control/joystick`, `/control/controller`).
+> Gli esempi `ros2 topic pub` qui sotto valgono solo con `odrive_can_node` lanciato da solo.
 
 Campi: `control_mode`, `input_mode`, `input_pos`, `input_vel`, `input_torque`.
 Per ogni messaggio il nodo invia 2 frame CAN (imposta modalità + setpoint).
@@ -179,30 +186,72 @@ rm -rf .git                                    # deve restare una cartella norma
 
 ---
 
-## Nodi del progetto portati su CAN
+## Nodi del progetto
 
-Entrambi lavorano in radianti: la conversione in giri (÷ 2π) è fatta dentro il nodo.
+Tutti lavorano in radianti: la conversione in giri (÷ 2π) è fatta dentro il nodo.
+
+### Mux dei comandi — `control_mux`
+
+Stessa logica di `twist_mux`, ma per `odrive_can/msg/ControlMessage` (`twist_mux` accetta solo `Twist`).
+È **l'unico nodo che pubblica su `/odrive_axis0/control_message`**.
+
+```
+overrun_node     ──> /control/safety      (priorità 1, timeout 0.5 s) ─┐
+joystick         ──> /control/joystick    (priorità 2, timeout 0.3 s) ─┼─> control_mux ──> /odrive_axis0/control_message
+tuo controllore  ──> /control/controller  (priorità 3, timeout 0.1 s) ─┘
+```
+
+- Una sorgente è attiva se ha pubblicato entro il suo timeout; passa all'ODrive la sorgente attiva con priorità più alta.
+- Se nessuna è attiva il mux manda **una volta** coppia 0 (l'ODrive altrimenti tiene l'ultimo setpoint).
+- La sorgente vincente è su `/control_mux/active` (`std_msgs/msg/String`, latched): `safety`, `joystick`, `controller` o `none`.
+- Ingressi best effort (accettano publisher reliable e best effort), uscita reliable.
+- Priorità, topic e timeout in `pendulum_safety_package/config/control_mux.yaml`.
+- Il mux filtra solo i setpoint: le richieste di stato (`/odrive_axis0/request_axis_state`) restano dirette.
+
+Un controllore scritto da te deve solo pubblicare `ControlMessage` su `/control/controller`
+almeno ogni 0.1 s (es. 200 Hz). Riceve il motore solo mentre `overrun_node` è in `VIGILANT` e il joystick tace.
+
+```bash
+ros2 topic echo /control_mux/active
+```
 
 ### `pendulum_safety_package` → `overrun_node`
 
-Trova i finecorsa del carrello e lo riporta al centro.
-Sequenza: IDLE → closed loop (8) → sweep in velocità (`control_mode: 2`, `input_mode: 1`) → centro → IDLE.
+Calibra la corsa del carrello, lo porta al centro e poi sorveglia due barriere virtuali.
+
+```
+START_UP -> ACTIVE -> PUSH_POS -> PAUSE_1 -> PUSH_NEG -> PAUSE_2 -> GO_CENTER -> READY -> VIGILANT
+                                                                                 ^          |
+                                                                                 |   barriera superata
+                                                                               REARM <- OVERRUN
+```
+
+| Stato | Cosa fa |
+|---|---|
+| `PUSH_POS` / `PUSH_NEG` | coppia ±`push_torque` (0.2 Nm) fino al fine corsa |
+| `GO_CENTER` | PID in coppia verso il centro (timeout 5 s) |
+| `READY` | coppia 0, parte `/pendulum_status` |
+| `VIGILANT` | **non pubblica**: il mux cede il motore a joystick/controllore. Barriere a 10 cm dai fine corsa, controllate a 200 Hz |
+| `OVERRUN` | barriera superata: coppia 0 + **IDLE**. Il terminale guida a riportare il carrello a mano entro ±5 cm dal centro |
+| `REARM` | coppia 0 + CLOSED_LOOP, poi `READY` → `VIGILANT` |
+| `ERROR` | timeout, telemetria persa, errore ODrive: coppia 0 + IDLE, definitivo |
+
+In tutti gli stati tranne `VIGILANT` il nodo pubblica (coppia di calibrazione o 0) a 10 Hz su `/control/safety`:
+finché lo fa, joystick e controllore sono esclusi dal mux.
 
 | Interfaccia | Tipo |
 |---|---|
-| pubblica `/odrive_axis0/control_message` | `odrive_can/msg/ControlMessage` |
+| pubblica `/control/safety` | `odrive_can/msg/ControlMessage` (ingresso priorità 1 del mux) |
+| pubblica `/pendulum_status` | `pendulum_safety_package/msg/PendulumStatus` (best effort, 200 Hz, da `READY` in poi) |
 | ascolta `/odrive_axis0/controller_status` | `odrive_can/msg/ControllerStatus` (best effort) |
 | client `/odrive_axis0/request_axis_state` | `odrive_can/srv/AxisState` |
-| pubblica `~/position_rad` | `std_msgs/msg/Float64` |
-| servizio `~/stop` | `std_srvs/srv/Trigger` (porta l'asse in IDLE) |
 
-```bash
-ros2 run pendulum_safety_package overrun_node
-```
+`PendulumStatus`: `position_m` (0 = centro), `velocity_m_s`, `stroke_m`. Puleggia HTD 5M 12 denti → 0.00955 m/rad.
 
 ### `single_pendulum_package` → `joystick_first_test_node`
 
 Muove il motore con il joystick (`/joy`, avviato dal launch) in velocità o coppia.
+Pubblica su `/control/joystick` (priorità 2 del mux).
 Parametri: `max_velocity` [rad/s] (10.0), `max_torque` [Nm] (10.0), `deadzone` (0.05).
 
 ```bash

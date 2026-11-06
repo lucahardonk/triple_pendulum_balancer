@@ -1,0 +1,13 @@
+control_mux:
+  ros__parameters:
+    output_topic: /odrive_axis0/control_message
+    inputs: [safety, joystick, controller]   # ordine = priorita' (il primo vince)
+    safety:                                  # overrun_node
+      topic: /control/safety
+      timeout: 0.5                           # overrun_node pubblica a 10 Hz
+    joystick:
+      topic: /control/joystick
+      timeout: 0.3
+    controller:                              # futuro controllore del pendolo
+      topic: /control/controller
+      timeout: 0.1

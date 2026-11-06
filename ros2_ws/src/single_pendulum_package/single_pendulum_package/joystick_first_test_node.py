@@ -47,9 +47,10 @@ class JoystickFirstTest(Node):
         self.joy_seen = False
         self.invalid_joy_reported = False
 
-        # odrive_can subscribes with a reliable QoS: publish reliable.
+        # Commands go to control_mux (priority 2, below the safety node),
+        # never directly to /odrive_axis0/control_message.
         self.publisher = self.create_publisher(
-            ControlMessage, "/odrive_axis0/control_message", 10
+            ControlMessage, "/control/joystick", 10
         )
         self.subscription = self.create_subscription(
             Joy, "/joy", self.on_joy, qos_profile_sensor_data

@@ -16,6 +16,10 @@
 // ERROR     -> timeout, telemetria persa, errore ODrive: coppia 0 + IDLE, fine
 //
 // /pendulum_status (da READY in poi): posizione [m] dal centro, velocita' [m/s], corsa [m]
+//
+// I comandi escono su /control/safety, la sorgente a priorita' massima di control_mux.
+// Il nodo pubblica (coppia di calibrazione o 0) in tutti gli stati tranne VIGILANT:
+// finche' pubblica, joystick e controllore sono esclusi. In VIGILANT tace e cede il motore.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -44,7 +48,8 @@ public:
     // Telemetria a 200 Hz: ripubblicazione SI + controllo barriere nello stesso callback.
     sub_ = create_subscription<ControllerStatus>("/odrive_axis0/controller_status",
       rclcpp::QoS(10).best_effort(), [this](ControllerStatus::SharedPtr m) { on_status(*m); });
-    pub_ = create_publisher<ControlMessage>("/odrive_axis0/control_message", 10);
+    // Comandi verso control_mux (priorita' massima), non direttamente all'ODrive.
+    pub_ = create_publisher<ControlMessage>("/control/safety", 10);
     status_pub_ = create_publisher<PendulumStatus>("/pendulum_status", rclcpp::QoS(10).best_effort());
     axis_ = create_client<AxisState>("/odrive_axis0/request_axis_state");
     timer_ = create_wall_timer(100ms, [this]() { step(); });
@@ -82,7 +87,7 @@ private:
   // ------------------------------------------------------------ macchina a stati (10 Hz)
   void step()
   {
-    if (state_ == State::ERROR) return;
+    if (state_ == State::ERROR) { send_torque(0.0); return; }   // tiene il mux bloccato per sempre
 
     const double pos = msg_.pos_estimate * kTau;   // [rad]
     const double vel = msg_.vel_estimate * kTau;   // [rad/s]
@@ -147,23 +152,23 @@ private:
       // ---------------- sorveglianza
       case State::READY:        // coppia gia' a 0: si passa subito alla sorveglianza
         go(State::VIGILANT, "barriere a +/-" + fmt(barrier_) + " m dal centro (" +
-           fmt(kBarrierMargin * 100.0) + " cm dai fine corsa)");
+           std::to_string(static_cast<int>(kBarrierMargin * 100.0)) + " cm dai fine corsa)");
         return;
 
-      case State::VIGILANT:     // il controllo e' in on_status(); qui non si comanda il motore
+      case State::VIGILANT:     // silenzio: il mux cede il motore alle sorgenti piu' basse
         return;
 
-      case State::OVERRUN:      // motore in IDLE: guida l'operatore
+      case State::OVERRUN:      // motore in IDLE: guida l'operatore (coppia 0 = mux bloccato)
         guide_operator();
-        return;
+        break;
 
       case State::REARM:        // closed_loop_ok_ arriva dalla risposta del servizio
         if (closed_loop_ok_) go(State::READY, "CLOSED_LOOP di nuovo attivo");
-        return;
+        break;
 
       default: return;
     }
-    send_torque(tq_);           // solo gli stati di calibrazione arrivano qui
+    send_torque(tq_);           // ogni stato tranne VIGILANT tiene la priorita' sul mux
   }
 
   // ------------------------------------------------------------ barriera superata
@@ -173,7 +178,7 @@ private:
     request_state(kIdle);
     RCLCPP_ERROR(get_logger(), "!!! BARRIERA %s SUPERATA: pos=%+.3f m, limite +/-%.3f m -> motore in IDLE",
       p > 0 ? "POSITIVA" : "NEGATIVA", p, barrier_);
-    go(State::OVERRUN, "riporta il carrello A MANO entro +/-" + fmt(kRecoverTol * 100.0) + " cm dal centro");
+    go(State::OVERRUN, "riporta il carrello A MANO entro +/-" + std::to_string(static_cast<int>(kRecoverTol * 100.0)) + " cm dal centro");
   }
 
   // Contatore a terminale (ogni 0.5 s): quanto manca e in che direzione spingere.
