@@ -10,7 +10,9 @@
 // GO_CENTER -> PID in coppia verso il centro; nel range kCenterTol e' arrivato
 // READY     -> coppia 0, calibrazione valida: parte /pendulum_status
 // VIGILANT  -> sorveglia (a 200 Hz) due barriere a kBarrierMargin dai fine corsa
-// OVERRUN   -> barriera superata: motore subito in IDLE, l'operatore riporta il carrello
+// BRAKE     -> barriera superata: frenata attiva (coppia opposta alla velocita', 200 Hz)
+//              finche' il carrello e' fermo o scade kBrakeTimeout, poi coppia 0 + IDLE
+// OVERRUN   -> motore in IDLE, l'operatore riporta il carrello
 //              al centro a mano (contatore a terminale)
 // REARM     -> carrello al centro da kRecoverHold s: richiede CLOSED_LOOP -> READY -> VIGILANT
 // ERROR     -> timeout, telemetria persa, errore ODrive: coppia 0 + IDLE, fine
@@ -59,10 +61,10 @@ public:
 
 private:
   enum class State { START_UP, ACTIVE, PUSH_POS, PAUSE_1, PUSH_NEG, PAUSE_2, GO_CENTER,
-                     READY, VIGILANT, OVERRUN, REARM, ERROR };
+                     READY, VIGILANT, BRAKE, OVERRUN, REARM, ERROR };
   static constexpr const char * kNames[] = {"START_UP", "ACTIVE", "PUSH_POS", "PAUSE_1", "PUSH_NEG",
-                                            "PAUSE_2", "GO_CENTER", "READY", "VIGILANT", "OVERRUN",
-                                            "REARM", "ERROR"};
+                                            "PAUSE_2", "GO_CENTER", "READY", "VIGILANT", "BRAKE",
+                                            "OVERRUN", "REARM", "ERROR"};
 
   // ------------------------------------------------------------ telemetria (200 Hz)
   void on_status(const ControllerStatus & m)
@@ -76,12 +78,13 @@ private:
     PendulumStatus s;
     s.header.stamp = now();
     s.position_m = p;
-    s.velocity_m_s = msg_.vel_estimate * kTau * kMPerRad;
+    s.velocity_m_s = vel_m_s();
     s.stroke_m = stroke_m();
     status_pub_->publish(s);
 
-    // Barriere virtuali: controllate a ogni messaggio, non a 10 Hz, per reagire subito.
+    // Barriere e frenata a ogni messaggio (200 Hz), non a 10 Hz, per reagire subito.
     if (state_ == State::VIGILANT && std::abs(p) > barrier_) trip(p);
+    else if (state_ == State::BRAKE) brake();
   }
 
   // ------------------------------------------------------------ macchina a stati (10 Hz)
@@ -158,6 +161,10 @@ private:
       case State::VIGILANT:     // silenzio: il mux cede il motore alle sorgenti piu' basse
         return;
 
+      case State::BRAKE:        // la coppia la manda brake() a 200 Hz; qui solo la rete di sicurezza
+        if (since(state_time_) > kBrakeTimeout) end_brake("timeout (telemetria lenta?)");
+        return;
+
       case State::OVERRUN:      // motore in IDLE: guida l'operatore (coppia 0 = mux bloccato)
         guide_operator();
         break;
@@ -172,12 +179,35 @@ private:
   }
 
   // ------------------------------------------------------------ barriera superata
+  // Il motore resta in CLOSED_LOOP e frena: il safety torna subito a vincere sul mux.
   void trip(double p)
+  {
+    RCLCPP_ERROR(get_logger(), "!!! BARRIERA %s SUPERATA: pos=%+.3f m, vel=%+.3f m/s, limite +/-%.3f m -> FRENATA",
+      p > 0 ? "POSITIVA" : "NEGATIVA", p, vel_m_s(), barrier_);
+    brake_pos_ = p;
+    go(State::BRAKE, "coppia opposta alla velocita' (max " + fmt(kBrakeMaxTorque) + " N*m)");
+    brake();
+  }
+
+  // Frenata viscosa: coppia = -kBrakeD * vel, saturata. Stessa convenzione di segno del
+  // termine D del PID di GO_CENTER (coppia + => velocita' +). Va a 0 da sola quando il
+  // carrello si ferma, quindi non puo' invertire il moto.
+  void brake()
+  {
+    const double v = vel_m_s();
+    if (std::abs(v) < kBrakeStopVel) return end_brake("carrello fermo");
+    if (since(state_time_) > kBrakeTimeout) return end_brake("timeout");
+    const double vel = msg_.vel_estimate * kTau;   // [rad/s]
+    send_torque(std::clamp(-kBrakeD * vel, -kBrakeMaxTorque, kBrakeMaxTorque));
+  }
+
+  void end_brake(const std::string & why)
   {
     send_torque(0.0);
     request_state(kIdle);
-    RCLCPP_ERROR(get_logger(), "!!! BARRIERA %s SUPERATA: pos=%+.3f m, limite +/-%.3f m -> motore in IDLE",
-      p > 0 ? "POSITIVA" : "NEGATIVA", p, barrier_);
+    const double p = pos_m();
+    RCLCPP_WARN(get_logger(), "frenata finita (%s) in %.2f s: pos=%+.3f m, vel=%+.3f m/s, spazio di frenata %.1f cm -> IDLE",
+      why.c_str(), since(state_time_), p, vel_m_s(), std::abs(p - brake_pos_) * 100.0);
     go(State::OVERRUN, "riporta il carrello A MANO entro +/-" + std::to_string(static_cast<int>(kRecoverTol * 100.0)) + " cm dal centro");
   }
 
@@ -271,6 +301,7 @@ private:
   static std::string fmt(double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return b; }
   double pos_m() const { return (msg_.pos_estimate * kTau - center_) * kMPerRad; }   // [m] dal centro
   double stroke_m() const { return std::abs(max_position_ - min_position_) * kMPerRad; }
+  double vel_m_s() const { return msg_.vel_estimate * kTau * kMPerRad; }
 
   // Fermo = posizione (2 decimali) invariata da 1 s.
   bool still(double pos)
@@ -311,10 +342,16 @@ private:
   static constexpr double kRecoverTol    = 0.05;   // [m] "al centro" per il riarmo
   static constexpr double kRecoverHold   = 1.0;    // [s] tempo da tenere fermo al centro
 
+  // frenata dopo la barriera
+  static constexpr double kBrakeD         = 0.02;  // [N*m/(rad/s)] satura gia' a ~0.2 m/s
+  static constexpr double kBrakeMaxTorque = 0.4;   // [N*m] (l'ODrive limita comunque alla sua corrente max)
+  static constexpr double kBrakeStopVel   = 0.02;  // [m/s] sotto questa velocita' e' "fermo"
+  static constexpr double kBrakeTimeout   = 1.0;   // [s] dopo questo tempo IDLE comunque
+
   static constexpr uint32_t kIdle = 1, kClosedLoop = 8, kTorqueControl = 1, kPassthrough = 1;
 
   double push_torque_{0.2}, tq_{0.0}, integ_{0.0};
-  double min_position_{0.0}, max_position_{0.0}, center_{0.0}, barrier_{0.0};
+  double min_position_{0.0}, max_position_{0.0}, center_{0.0}, barrier_{0.0}, brake_pos_{0.0};
   double last_pos_{1e9}, start_pos_{0.0};
   bool have_msg_{false}, closed_loop_ok_{false}, moved_{false}, calibrated_{false};
   State state_{State::START_UP};

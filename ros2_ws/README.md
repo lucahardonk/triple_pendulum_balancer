@@ -223,7 +223,8 @@ Calibra la corsa del carrello, lo porta al centro e poi sorveglia due barriere v
 START_UP -> ACTIVE -> PUSH_POS -> PAUSE_1 -> PUSH_NEG -> PAUSE_2 -> GO_CENTER -> READY -> VIGILANT
                                                                                  ^          |
                                                                                  |   barriera superata
-                                                                               REARM <- OVERRUN
+                                                                                 |          v
+                                                                               REARM <- OVERRUN <- BRAKE
 ```
 
 | Stato | Cosa fa |
@@ -232,7 +233,8 @@ START_UP -> ACTIVE -> PUSH_POS -> PAUSE_1 -> PUSH_NEG -> PAUSE_2 -> GO_CENTER ->
 | `GO_CENTER` | PID in coppia verso il centro (timeout 5 s) |
 | `READY` | coppia 0, parte `/pendulum_status` |
 | `VIGILANT` | **non pubblica**: il mux cede il motore a joystick/controllore. Barriere a 10 cm dai fine corsa, controllate a 200 Hz |
-| `OVERRUN` | barriera superata: coppia 0 + **IDLE**. Il terminale guida a riportare il carrello a mano entro ±5 cm dal centro |
+| `BRAKE` | barriera superata: **frenata attiva** a 200 Hz, coppia = −0.02·vel [rad/s], max 0.4 Nm, finché v < 2 cm/s (max 1 s). Logga lo spazio di frenata |
+| `OVERRUN` | coppia 0 + **IDLE**. Il terminale guida a riportare il carrello a mano entro ±5 cm dal centro |
 | `REARM` | coppia 0 + CLOSED_LOOP, poi `READY` → `VIGILANT` |
 | `ERROR` | timeout, telemetria persa, errore ODrive: coppia 0 + IDLE, definitivo |
 
