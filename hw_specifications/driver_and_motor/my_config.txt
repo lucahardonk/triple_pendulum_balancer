@@ -56,3 +56,168 @@ odrv0.axis1.config.can_node_id = 63
 
 dump_errors(odrv0)
 odrv0.clear_errors()
+
+
+
+
+///-----------------------------------------------------------------------> ai version
+
+# =====================================================================
+# Configurazione ODrive - MKS XDrive Mini (firmware 0.5.1)
+# Motore 6374 170KV, encoder assoluto AMS via SPI, solo asse 0, CAN 250 kbit/s
+#
+# COME USARLO
+# - Incolla in odrivetool UN BLOCCO ALLA VOLTA.
+# - Dopo ogni save_configuration() l'ODrive si riavvia: aspetta che
+#   odrivetool scriva di nuovo "Connected to ODrive ... as odrv0"
+#   prima di passare al blocco successivo.
+# - Chiudi il launch ROS prima di iniziare (il CAN si blocca se l'ODrive
+#   si riavvia mentre ROS lo interroga).
+#
+# NON usare odrv0.erase_configuration() se non strettamente necessario:
+# cancella TUTTO, calibrazioni comprese.
+#
+# L'errore AXIS_ERROR_CURRENT_MEASUREMENT_TIMEOUT su axis1 e' normale su
+# questa scheda (un solo stadio di potenza): va ignorato. Guarda solo axis0.
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 1 - Alimentazione e resistenza di frenatura
+# ---------------------------------------------------------------------
+odrv0.config.brake_resistance = 2.0
+odrv0.config.dc_bus_undervoltage_trip_level = 8.0
+odrv0.config.dc_bus_overvoltage_trip_level = 56.0
+odrv0.config.dc_max_positive_current = 20.0
+odrv0.config.dc_max_negative_current = -3.0
+odrv0.config.max_regen_current = 0
+odrv0.save_configuration()
+# -> aspetta la riconnessione
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 2 - Motore
+# requested_current_range = fondo scala dei sensori di corrente [A].
+# Cambiarlo richiede riavvio e nuova calibrazione del motore (blocco 6).
+# current_lim 10 e' conservativo: alzarlo (verso 40) solo quando la
+# meccanica e' riparata. Deve restare current_lim + margin < 60.
+# ---------------------------------------------------------------------
+odrv0.axis0.motor.config.pole_pairs = 7                    # 6374: 14 magneti / 2 (confermato in calibrazione)
+odrv0.axis0.motor.config.calibration_current = 10
+odrv0.axis0.motor.config.resistance_calib_max_voltage = 2
+odrv0.axis0.motor.config.motor_type = MOTOR_TYPE_HIGH_CURRENT
+odrv0.axis0.motor.config.requested_current_range = 60
+odrv0.axis0.motor.config.current_lim = 10
+odrv0.axis0.motor.config.current_lim_margin = 10
+odrv0.axis0.motor.config.torque_constant = 8.27 / 170      # = 0.0486 N*m/A (8.27 / KV)
+odrv0.save_configuration()
+# -> aspetta la riconnessione
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 3 - Encoder AMS (AS5047/AS5048) via SPI
+# calib_range = tolleranza della calibrazione offset:
+#   0.02 (default) troppo stretto con la cinghia montata (scarto misurato 3.3%)
+#   10 disattiva il controllo; 0.1 = valore trovato nei test.
+# ---------------------------------------------------------------------
+odrv0.axis0.encoder.config.mode = ENCODER_MODE_SPI_ABS_AMS
+odrv0.axis0.encoder.config.abs_spi_cs_gpio_pin = 7
+odrv0.axis0.encoder.config.cpr = 16384
+odrv0.axis0.encoder.config.bandwidth = 3000
+odrv0.axis0.encoder.config.calib_range = 0.1
+odrv0.save_configuration()
+# -> aspetta la riconnessione
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 4 - Controllore (controllo in velocita', usato da ROS)
+# vel_limit in giri/s: 10 per i test, alzarlo per movimenti piu' rapidi.
+# ---------------------------------------------------------------------
+odrv0.axis0.controller.config.control_mode = CONTROL_MODE_VELOCITY_CONTROL
+odrv0.axis0.controller.config.input_mode = INPUT_MODE_PASSTHROUGH
+odrv0.axis0.controller.config.vel_limit = 10
+odrv0.axis0.controller.config.vel_gain = 0.02
+odrv0.axis0.controller.config.vel_integrator_gain = 0.2
+odrv0.save_configuration()
+# -> aspetta la riconnessione
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 5 - CAN e avvio in IDLE
+# Il bitrate deve coincidere con can0 sul NUC (regola udev: 250000).
+# Avvio in IDLE: il closed loop lo chiede ROS (tasto 3 del joystick).
+# ---------------------------------------------------------------------
+odrv0.axis0.config.can_node_id = 0
+odrv0.axis1.config.can_node_id = 63
+odrv0.can.set_baud_rate(250000)
+odrv0.axis0.config.startup_motor_calibration = False
+odrv0.axis0.config.startup_encoder_offset_calibration = False
+odrv0.axis0.config.startup_closed_loop_control = False
+odrv0.save_configuration()
+# -> aspetta la riconnessione
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 6 - Calibrazione motore (stato 4)
+# Carrello a meta' corsa e libero. Il motore fa un beep.
+# ---------------------------------------------------------------------
+dump_errors(odrv0, True)
+odrv0.axis0.requested_state = AXIS_STATE_MOTOR_CALIBRATION
+# Aspetta che odrv0.axis0.current_state torni a 1, poi controlla:
+dump_errors(odrv0)                                 # axis0 deve essere "no error"
+print(odrv0.axis0.motor.is_calibrated)             # deve essere True
+# Solo se tutto ok:
+odrv0.axis0.motor.config.pre_calibrated = True
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 7 - Calibrazione offset encoder (stato 7)
+# Carrello a meta' corsa. Il motore deve girare AVANTI e poi INDIETRO.
+# Se va solo avanti e da' CPR_POLEPAIRS_MISMATCH: controlla cinghia/attrito.
+# ---------------------------------------------------------------------
+dump_errors(odrv0, True)
+odrv0.axis0.requested_state = AXIS_STATE_ENCODER_OFFSET_CALIBRATION
+# Aspetta che odrv0.axis0.current_state torni a 1, poi controlla:
+dump_errors(odrv0)                                 # axis0 deve essere "no error"
+print(odrv0.axis0.encoder.is_ready)                # deve essere True
+# Solo se tutto ok:
+odrv0.axis0.encoder.config.pre_calibrated = True
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 8 - Salvataggio finale
+# L'ODrive si riavvia in IDLE (motore libero), senza ricalibrare.
+# ---------------------------------------------------------------------
+odrv0.axis0.config.startup_encoder_offset_calibration = False
+odrv0.axis0.config.startup_closed_loop_control = False
+odrv0.save_configuration()
+# -> aspetta la riconnessione e poi ALTRI 5 SECONDI (il chip AMS si
+#    inizializza) prima di leggere encoder.is_ready
+
+
+# ---------------------------------------------------------------------
+# BLOCCO 9 - Verifica
+# Atteso: axis0 "no error" (axis1 CURRENT_MEASUREMENT_TIMEOUT si ignora)
+#   True True True True 1
+#   60.0 10.0 10.0 0.0486...
+#   0.1 16384 7  /  2 10.0  /  0 63 250000
+#   False False
+# ---------------------------------------------------------------------
+dump_errors(odrv0, True)
+dump_errors(odrv0)
+a = odrv0.axis0; m = a.motor.config; e = a.encoder.config; k = a.controller.config
+print(a.motor.is_calibrated, m.pre_calibrated, a.encoder.is_ready, e.pre_calibrated, a.current_state)
+print(m.requested_current_range, m.current_lim, m.current_lim_margin, m.torque_constant)
+print(e.calib_range, e.cpr, m.pole_pairs)
+print(k.control_mode, k.vel_limit)
+print(a.config.can_node_id, odrv0.axis1.config.can_node_id, odrv0.can.config.baud_rate)
+print(a.config.startup_encoder_offset_calibration, a.config.startup_closed_loop_control)
+
+
+# =====================================================================
+# AVVIO NORMALE (dopo la configurazione)
+# 1. Collega USB ODrive (massa comune) -> adattatore CAN -> alimentazione
+# 2. Aspetta 5 secondi
+# 3. ros2 launch pendulum_bringup hardware.launch.py
+# 4. Nodo joystick: tasto 0 (IDLE) -> 2 (velocita') -> 3 (closed loop)
+# =====================================================================
