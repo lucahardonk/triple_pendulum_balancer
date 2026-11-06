@@ -1,355 +1,325 @@
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float64.hpp>
-#include <std_srvs/srv/trigger.hpp>
-#include <odrive_can/msg/control_message.hpp>
-#include <odrive_can/msg/controller_status.hpp>
-#include <odrive_can/srv/axis_state.hpp>
-
+// overrun_node: calibra la corsa del carrello, lo porta al centro, ripubblica la
+// telemetria in unita' SI su /pendulum_status e sorveglia due barriere virtuali.
+//
+// START_UP  -> attende la telemetria CAN
+// ACTIVE    -> coppia 0 e richiesta CLOSED_LOOP
+// PUSH_POS  -> coppia +push_torque fino a carrello fermo           => min_position
+// PAUSE_1   -> coppia 0 per 1 s
+// PUSH_NEG  -> coppia -push_torque fino a carrello fermo           => max_position
+// PAUSE_2   -> coppia 0 per 1 s
+// GO_CENTER -> PID in coppia verso il centro; nel range kCenterTol e' arrivato
+// READY     -> coppia 0, calibrazione valida: parte /pendulum_status
+// VIGILANT  -> sorveglia (a 200 Hz) due barriere a kBarrierMargin dai fine corsa
+// OVERRUN   -> barriera superata: motore subito in IDLE, l'operatore riporta il carrello
+//              al centro a mano (contatore a terminale)
+// REARM     -> carrello al centro da kRecoverHold s: richiede CLOSED_LOOP -> READY -> VIGILANT
+// ERROR     -> timeout, telemetria persa, errore ODrive: coppia 0 + IDLE, fine
+//
+// /pendulum_status (da READY in poi): posizione [m] dal centro, velocita' [m/s], corsa [m]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <deque>
-#include <memory>
-#include <stdexcept>
 #include <string>
-#include <utility>
+#include <rclcpp/rclcpp.hpp>
+#include <odrive_can/msg/controller_status.hpp>
+#include <odrive_can/msg/control_message.hpp>
+#include <odrive_can/srv/axis_state.hpp>
+#include <pendulum_safety_package/msg/pendulum_status.hpp>
 
 using namespace std::chrono_literals;
+using odrive_can::msg::ControllerStatus;
+using odrive_can::msg::ControlMessage;
+using odrive_can::srv::AxisState;
+using pendulum_safety_package::msg::PendulumStatus;
+using Clock = std::chrono::steady_clock;
 
 class OverrunNode : public rclcpp::Node
 {
 public:
-  using Trigger = std_srvs::srv::Trigger;
-  using AxisState = odrive_can::srv::AxisState;
-  using ControlMessage = odrive_can::msg::ControlMessage;
-  using ControllerStatus = odrive_can::msg::ControllerStatus;
-  using Client = rclcpp::Client<AxisState>;
-  using Clock = std::chrono::steady_clock;
-
   OverrunNode() : Node("overrun_node")
   {
-    // odrive_can subscribes with a reliable QoS: the publisher must be reliable.
-    command_pub_ = create_publisher<ControlMessage>(
-      "/odrive_axis0/control_message", rclcpp::QoS(10));
+    push_torque_ = declare_parameter("push_torque", 0.2);
 
-    position_pub_ = create_publisher<std_msgs::msg::Float64>(
-      "~/position_rad", 10);
+    // Telemetria a 200 Hz: ripubblicazione SI + controllo barriere nello stesso callback.
+    sub_ = create_subscription<ControllerStatus>("/odrive_axis0/controller_status",
+      rclcpp::QoS(10).best_effort(), [this](ControllerStatus::SharedPtr m) { on_status(*m); });
+    pub_ = create_publisher<ControlMessage>("/odrive_axis0/control_message", 10);
+    status_pub_ = create_publisher<PendulumStatus>("/pendulum_status", rclcpp::QoS(10).best_effort());
+    axis_ = create_client<AxisState>("/odrive_axis0/request_axis_state");
+    timer_ = create_wall_timer(100ms, [this]() { step(); });
 
-    axis_state_ = create_client<AxisState>(
-      "/odrive_axis0/request_axis_state");
-
-    feedback_sub_ = create_subscription<ControllerStatus>(
-      "/odrive_axis0/controller_status", rclcpp::QoS(10).best_effort(),
-      [this](ControllerStatus::SharedPtr msg) {
-        feedback(*msg);
-      });
-
-    stop_service_ = create_service<Trigger>(
-      "~/stop",
-      [this](
-        const std::shared_ptr<Trigger::Request>,
-        std::shared_ptr<Trigger::Response> response)
-      {
-        stop("Manual stop");
-        response->success = true;
-        response->message = "IDLE requested";
-      });
-
-    timer_ = create_wall_timer(10ms, [this]() { tick(); });
+    go(State::START_UP, "avvio nodo");
   }
 
 private:
-  enum class State {
-    WAITING,
-    SERVICE,
-    IDLE_SETTLE,
-    ENABLE,
-    ENABLE_SETTLE,
-    FIRST_SWEEP,
-    SECOND_SWEEP,
-    CENTERING,
-    READY,
-    STOPPED
-  };
+  enum class State { START_UP, ACTIVE, PUSH_POS, PAUSE_1, PUSH_NEG, PAUSE_2, GO_CENTER,
+                     READY, VIGILANT, OVERRUN, REARM, ERROR };
+  static constexpr const char * kNames[] = {"START_UP", "ACTIVE", "PUSH_POS", "PAUSE_1", "PUSH_NEG",
+                                            "PAUSE_2", "GO_CENTER", "READY", "VIGILANT", "OVERRUN",
+                                            "REARM", "ERROR"};
 
-  static double steady()
+  // ------------------------------------------------------------ telemetria (200 Hz)
+  void on_status(const ControllerStatus & m)
   {
-    return std::chrono::duration<double>(
-      Clock::now().time_since_epoch()).count();
+    msg_ = m;
+    msg_time_ = Clock::now();
+    have_msg_ = true;
+    if (!calibrated_) return;                      // niente /pendulum_status prima di READY
+
+    const double p = pos_m();
+    PendulumStatus s;
+    s.header.stamp = now();
+    s.position_m = p;
+    s.velocity_m_s = msg_.vel_estimate * kTau * kMPerRad;
+    s.stroke_m = stroke_m();
+    status_pub_->publish(s);
+
+    // Barriere virtuali: controllate a ogni messaggio, non a 10 Hz, per reagire subito.
+    if (state_ == State::VIGILANT && std::abs(p) > barrier_) trip(p);
   }
 
-  // Velocity command in rad/s, sent to the ODrive in turns/s.
-  void command(double velocity)
+  // ------------------------------------------------------------ macchina a stati (10 Hz)
+  void step()
   {
-    ControlMessage msg;
-    msg.control_mode = kVelocityControl;
-    msg.input_mode = kPassthrough;
-    msg.input_vel = static_cast<float>(velocity / kTau);
-    msg.input_torque = 0.0F;
-    command_pub_->publish(msg);
-  }
+    if (state_ == State::ERROR) return;
 
-  static std::shared_ptr<AxisState::Request> request(uint32_t state)
-  {
-    auto req = std::make_shared<AxisState::Request>();
-    req->axis_requested_state = state;
-    return req;
-  }
+    const double pos = msg_.pos_estimate * kTau;   // [rad]
+    const double vel = msg_.vel_estimate * kTau;   // [rad/s]
 
-  void call(uint32_t requested, State next)
-  {
-    state_ = State::SERVICE;
+    // Controlli di sicurezza. READY/VIGILANT/OVERRUN possono durare quanto vogliono.
+    const bool timed = state_ != State::READY && state_ != State::VIGILANT && state_ != State::OVERRUN;
+    const double limit = (state_ == State::GO_CENTER) ? kTimeoutCenter : kTimeout;
+    if (timed && since(state_time_) > limit) return fail("timeout stato");
+    if (state_ != State::START_UP) {
+      if (since(msg_time_) > kTelemTimeout) return fail("telemetria CAN persa");
+      if (msg_.active_errors) return fail("errore ODrive");
+    }
 
-    axis_state_->async_send_request(
-      request(requested),
-      [this, requested, next](Client::SharedFuture future) {
-        if (state_ == State::STOPPED) {
-          return;
+    tq_ = 0.0;
+    switch (state_) {
+      // ---------------- calibrazione
+      case State::START_UP:
+        if (have_msg_) go(State::ACTIVE, "telemetria ok, pos=" + fmt(pos) + " rad");
+        break;
+
+      case State::ACTIVE:
+        if (closed_loop_ok_) go(State::PUSH_POS, "CLOSED_LOOP attivo, parte spinta +" + fmt(push_torque_) + " N*m");
+        break;
+
+      case State::PUSH_POS:
+        tq_ = +push_torque_;
+        if (stopped(pos)) {
+          min_position_ = pos;
+          go(State::PAUSE_1, "min_position=" + fmt(min_position_) + " rad");
         }
+        break;
 
-        try {
-          const auto response = future.get();
-          if (response->axis_state != requested) {
-            stop(
-              "Axis state " + std::to_string(response->axis_state) +
-              " instead of " + std::to_string(requested) +
-              " (errors 0x" + to_hex(response->active_errors) + ")");
-            return;
-          }
+      case State::PAUSE_1:
+        if (since(state_time_) > 1.0) go(State::PUSH_NEG, "parte spinta -" + fmt(push_torque_) + " N*m");
+        break;
 
-          state_ = next;
-          state_since_ = steady();
-
-          if (next == State::READY) {
-            RCLCPP_INFO(
-              get_logger(), "READY: IDLE; barriers active");
-          }
-        } catch (const std::exception & e) {
-          stop(e.what());
+      case State::PUSH_NEG:
+        tq_ = -push_torque_;
+        if (stopped(pos)) {
+          max_position_ = pos;
+          center_ = (min_position_ + max_position_) / 2.0;
+          barrier_ = std::max(0.0, stroke_m() / 2.0 - kBarrierMargin);
+          go(State::PAUSE_2, "max_position=" + fmt(max_position_) + " rad, corsa=" + fmt(stroke_m()) +
+             " m, centro=" + fmt(center_) + " rad");
         }
-      });
+        break;
+
+      case State::PAUSE_2:
+        if (since(state_time_) > 1.0) go(State::GO_CENTER, "vado verso il centro");
+        break;
+
+      case State::GO_CENTER: {  // PID in coppia: P sull'errore, I contro l'attrito, D sulla velocita'
+        const double err = center_ - pos;
+        if (std::abs(err) < kIntRange)
+          integ_ = std::clamp(integ_ + err * kDt, -kMaxI / kI, kMaxI / kI);
+        tq_ = std::clamp(kP * err + kI * integ_ - kD * vel, -kMaxTorque, kMaxTorque);
+        if (std::abs(err) < kCenterTol)
+          go(State::READY, "al centro, pos=" + fmt(pos_m()) + " m, err=" + fmt(err) + " rad");
+        break;
+      }
+
+      // ---------------- sorveglianza
+      case State::READY:        // coppia gia' a 0: si passa subito alla sorveglianza
+        go(State::VIGILANT, "barriere a +/-" + fmt(barrier_) + " m dal centro (" +
+           fmt(kBarrierMargin * 100.0) + " cm dai fine corsa)");
+        return;
+
+      case State::VIGILANT:     // il controllo e' in on_status(); qui non si comanda il motore
+        return;
+
+      case State::OVERRUN:      // motore in IDLE: guida l'operatore
+        guide_operator();
+        return;
+
+      case State::REARM:        // closed_loop_ok_ arriva dalla risposta del servizio
+        if (closed_loop_ok_) go(State::READY, "CLOSED_LOOP di nuovo attivo");
+        return;
+
+      default: return;
+    }
+    send_torque(tq_);           // solo gli stati di calibrazione arrivano qui
   }
 
-  void stop(const std::string & reason)
+  // ------------------------------------------------------------ barriera superata
+  void trip(double p)
   {
-    if (state_ == State::STOPPED) {
+    send_torque(0.0);
+    request_state(kIdle);
+    RCLCPP_ERROR(get_logger(), "!!! BARRIERA %s SUPERATA: pos=%+.3f m, limite +/-%.3f m -> motore in IDLE",
+      p > 0 ? "POSITIVA" : "NEGATIVA", p, barrier_);
+    go(State::OVERRUN, "riporta il carrello A MANO entro +/-" + fmt(kRecoverTol * 100.0) + " cm dal centro");
+  }
+
+  // Contatore a terminale (ogni 0.5 s): quanto manca e in che direzione spingere.
+  void guide_operator()
+  {
+    const double p = pos_m();
+    const bool inside = std::abs(p) < kRecoverTol;
+    if (!inside) in_range_since_ = Clock::now();
+
+    const double held = since(in_range_since_);
+    if (held > kRecoverHold) {
+      go(State::REARM, "OK, carrello al centro (pos=" + fmt(p) + " m), richiedo CLOSED_LOOP");
       return;
     }
 
-    state_ = State::STOPPED;
-    RCLCPP_WARN(get_logger(), "%s; requesting IDLE", reason.c_str());
-
-    // No braking command: request IDLE directly.
-    axis_state_->async_send_request(request(kIdle));
-  }
-
-  static std::string to_hex(uint32_t value)
-  {
-    char buffer[9];
-    std::snprintf(buffer, sizeof(buffer), "%X", value);
-    return buffer;
-  }
-
-  void start_sweep(State state, double direction)
-  {
-    state_ = state;
-    direction_ = direction;
-    history_.clear();
-
-    // Allow startup/reversal before observing a full stationary window.
-    observe_after_ = steady() + 0.5;
-    command(direction_ * speed_);
-
-    RCLCPP_INFO(
-      get_logger(), "Sweep: %.3f rad/s", direction_ * speed_);
-  }
-
-  void feedback(const ControllerStatus & status)
-  {
-    try {
-      // odrive_can reports turns: convert to rad.
-      position_ = static_cast<double>(status.pos_estimate) * kTau;
-      if (!std::isfinite(position_)) {
-        throw std::runtime_error("Invalid position");
-      }
-
-      have_position_ = true;
-      const double now = steady();
-
-      if (calibrated_) {
-        std_msgs::msg::Float64 msg;
-        msg.data = position_ - center_;
-        position_pub_->publish(msg);
-      }
-
-      if (barriers_active_ &&
-          std::abs(position_ - center_) >= barrier_)
-      {
-        stop("Virtual barrier crossed");
-        return;
-      }
-
-      if (state_ == State::CENTERING) {
-        const double error = center_ - position_;
-
-        if (std::abs(error) <= center_tolerance_) {
-          command(0.0);
-          barriers_active_ = true;
-          call(kIdle, State::READY);
-        } else {
-          command(std::clamp(error, -speed_, speed_));
-        }
-        return;
-      }
-
-      if (state_ != State::FIRST_SWEEP &&
-          state_ != State::SECOND_SWEEP)
-      {
-        return;
-      }
-
-      if (now < observe_after_) {
-        return;
-      }
-
-      history_.emplace_back(now, position_);
-
-      while (history_.size() >= 2 &&
-             history_[1].first <= now - stall_window_)
-      {
-        history_.pop_front();
-      }
-
-      if (history_.size() < 2 ||
-          now - history_.front().first < stall_window_)
-      {
-        return;
-      }
-
-      // A gap in messages is not evidence of a stationary encoder.
-      for (std::size_t i = 1; i < history_.size(); ++i) {
-        if (history_[i].first - history_[i - 1].first >
-            stall_window_ / 2.0)
-        {
-          history_.clear();
-          history_.emplace_back(now, position_);
-          return;
-        }
-      }
-
-      double minimum = history_.front().second;
-      double maximum = minimum;
-
-      for (const auto & sample : history_) {
-        minimum = std::min(minimum, sample.second);
-        maximum = std::max(maximum, sample.second);
-      }
-
-      if (maximum - minimum > stall_distance_) {
-        return;
-      }
-
-      if (state_ == State::FIRST_SWEEP) {
-        first_endpoint_ = position_;
-        RCLCPP_INFO(
-          get_logger(), "First endpoint: %.6f rad", first_endpoint_);
-        start_sweep(State::SECOND_SWEEP, 1.0);
-        return;
-      }
-
-      const double span = position_ - first_endpoint_;
-
-      if (span <= 2.0 * center_tolerance_ / 0.9) {
-        stop("Measured range insufficient to define center and barriers");
-        return;
-      }
-
-      center_ = (first_endpoint_ + position_) / 2.0;
-      barrier_ = 0.9 * span / 2.0;
-      calibrated_ = true;
-
-      RCLCPP_INFO(
-        get_logger(),
-        "min=%.6f rad, max=%.6f rad, center=%.6f rad; "
-        "barriers relative to center: [%.6f, %.6f] rad",
-        first_endpoint_, position_, center_, -barrier_, barrier_);
-
-      state_ = State::CENTERING;
-      command(std::clamp(center_ - position_, -speed_, speed_));
-
-    } catch (const std::exception & e) {
-      stop(e.what());
+    if (since(last_hint_) < 0.5) return;
+    last_hint_ = Clock::now();
+    if (inside) {
+      RCLCPP_INFO(get_logger(), "[OVERRUN] OK al centro (pos=%+.3f m): tieni fermo ancora %.1f s",
+        p, kRecoverHold - held);
+    } else {
+      RCLCPP_WARN(get_logger(), "[OVERRUN] mancano %5.1f cm  -> spingi verso il lato %s   (pos=%+.3f m)",
+        (std::abs(p) - kRecoverTol) * 100.0, p > 0 ? "NEGATIVO (-)" : "POSITIVO (+)", p);
     }
   }
 
-  void tick()
+  // ------------------------------------------------------------ transizioni
+  void go(State next, const std::string & info)
   {
-    switch (state_) {
-      case State::WAITING:
-        if (have_position_ && axis_state_->service_is_ready()) {
-          call(kIdle, State::IDLE_SETTLE);
-        }
-        break;
+    RCLCPP_INFO(get_logger(), "%s -> %s | %s", kNames[static_cast<int>(state_)],
+      kNames[static_cast<int>(next)], info.c_str());
+    state_ = next;
+    state_time_ = Clock::now();
+    tq_ = 0.0;
+    last_pos_ = 1e9;                       // reset rilevamento fermo
+    start_pos_ = msg_.pos_estimate * kTau;
+    moved_ = false;
+    integ_ = 0.0;
+    in_range_since_ = Clock::now();
+    last_hint_ = Clock::time_point{};      // primo suggerimento OVERRUN subito
 
-      case State::IDLE_SETTLE:
-        if (steady() - state_since_ >= 0.2) {
-          // Velocity/passthrough with zero setpoint is set while IDLE.
-          command(0.0);
-          state_ = State::ENABLE;
-        }
+    switch (next) {                        // azioni d'ingresso
+      case State::ACTIVE:
+      case State::REARM:                   // coppia 0 + CLOSED_LOOP
+        closed_loop_ok_ = false;
+        send_torque(0.0);
+        request_state(kClosedLoop);
         break;
-
-      case State::ENABLE:
-        command(0.0);
-        call(kClosedLoop, State::ENABLE_SETTLE);
+      case State::READY:                   // calibrazione valida: parte /pendulum_status
+        send_torque(0.0);
+        calibrated_ = true;
         break;
-
-      case State::ENABLE_SETTLE:
-        if (steady() - state_since_ >= 0.2) {
-          start_sweep(State::FIRST_SWEEP, -1.0);
-        }
-        break;
-
-      case State::FIRST_SWEEP:
-      case State::SECOND_SWEEP:
-        command(direction_ * speed_);
-        break;
-
-      default:
-        break;
+      default: break;
     }
   }
 
-  static constexpr uint32_t kIdle = 1;
-  static constexpr uint32_t kClosedLoop = 8;
-  static constexpr uint32_t kVelocityControl = 2;
-  static constexpr uint32_t kPassthrough = 1;
-  static constexpr double kTau = 2.0 * M_PI;
+  void fail(const std::string & why)
+  {
+    RCLCPP_ERROR(get_logger(), "ERRORE in %s: %s (err=0x%X)", kNames[static_cast<int>(state_)],
+      why.c_str(), msg_.active_errors);
+    send_torque(0.0);
+    request_state(kIdle);
+    state_ = State::ERROR;
+  }
 
-  State state_{State::WAITING};
+  // ------------------------------------------------------------ comandi ODrive
+  void send_torque(double torque)
+  {
+    ControlMessage cmd;
+    cmd.control_mode = kTorqueControl;
+    cmd.input_mode = kPassthrough;
+    cmd.input_torque = static_cast<float>(torque);
+    pub_->publish(cmd);
+  }
 
-  const double speed_{1.0};             // rad/s
-  const double stall_window_{0.5};      // s
-  const double stall_distance_{0.02};   // rad
-  const double center_tolerance_{0.05}; // rad
+  void request_state(uint32_t requested)
+  {
+    auto req = std::make_shared<AxisState::Request>();
+    req->axis_requested_state = requested;
+    axis_->async_send_request(req, [this, requested](rclcpp::Client<AxisState>::SharedFuture f) {
+      auto r = f.get();
+      if (requested != kClosedLoop) return;
+      if (r->axis_state == kClosedLoop && r->active_errors == 0) closed_loop_ok_ = true;
+      else fail("CLOSED_LOOP rifiutato");
+    });
+  }
 
-  double position_{0.0};
-  double first_endpoint_{0.0};
-  double center_{0.0}, barrier_{0.0};
-  double direction_{-1.0};
-  double state_since_{0.0}, observe_after_{0.0};
+  // ------------------------------------------------------------ utilita'
+  static double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
+  static std::string fmt(double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return b; }
+  double pos_m() const { return (msg_.pos_estimate * kTau - center_) * kMPerRad; }   // [m] dal centro
+  double stroke_m() const { return std::abs(max_position_ - min_position_) * kMPerRad; }
 
-  bool have_position_{false};
-  bool calibrated_{false}, barriers_active_{false};
+  // Fermo = posizione (2 decimali) invariata da 1 s.
+  bool still(double pos)
+  {
+    const double r = std::round(pos * 100.0) / 100.0;
+    if (r != last_pos_) { last_pos_ = r; still_since_ = Clock::now(); }
+    return since(still_since_) > 1.0;
+  }
 
-  std::deque<std::pair<double, double>> history_;
+  // Si e' mosso di almeno 0.05 rad dalla partenza e ora e' fermo (evita il falso "fermo" iniziale).
+  bool stopped(double pos)
+  {
+    if (std::abs(pos - start_pos_) > 0.05) moved_ = true;
+    return still(pos) && moved_;
+  }
 
-  Client::SharedPtr axis_state_;
-  rclcpp::Publisher<ControlMessage>::SharedPtr command_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr position_pub_;
-  rclcpp::Subscription<ControllerStatus>::SharedPtr feedback_sub_;
-  rclcpp::Service<Trigger>::SharedPtr stop_service_;
+  // ------------------------------------------------------------ dati
+  static constexpr double kTau         = 2.0 * M_PI;
+  static constexpr double kPulleyPitch = 0.005;          // [m] HTD 5M
+  static constexpr double kPulleyTeeth = 12.0;
+  static constexpr double kMPerRad     = kPulleyPitch * kPulleyTeeth / kTau;  // ~0.00955 m/rad
+
+  // calibrazione
+  static constexpr double kDt            = 0.1;    // [s] periodo del timer
+  static constexpr double kTimeout       = 15.0;   // [s] max per stato
+  static constexpr double kTimeoutCenter = 5.0;    // [s] max per GO_CENTER
+  static constexpr double kTelemTimeout  = 2.0;    // [s] telemetria ferma
+  static constexpr double kCenterTol     = 0.3;    // [rad]
+  static constexpr double kP             = 0.1;    // [N*m/rad]
+  static constexpr double kI             = 0.05;   // [N*m/(rad*s)]
+  static constexpr double kD             = 0.01;   // [N*m/(rad/s)]
+  static constexpr double kMaxI          = 0.08;   // [N*m]
+  static constexpr double kIntRange      = 5.0;    // [rad]
+  static constexpr double kMaxTorque     = 0.2;    // [N*m]
+
+  // sorveglianza
+  static constexpr double kBarrierMargin = 0.10;   // [m] barriera a 10 cm da ogni fine corsa
+  static constexpr double kRecoverTol    = 0.05;   // [m] "al centro" per il riarmo
+  static constexpr double kRecoverHold   = 1.0;    // [s] tempo da tenere fermo al centro
+
+  static constexpr uint32_t kIdle = 1, kClosedLoop = 8, kTorqueControl = 1, kPassthrough = 1;
+
+  double push_torque_{0.2}, tq_{0.0}, integ_{0.0};
+  double min_position_{0.0}, max_position_{0.0}, center_{0.0}, barrier_{0.0};
+  double last_pos_{1e9}, start_pos_{0.0};
+  bool have_msg_{false}, closed_loop_ok_{false}, moved_{false}, calibrated_{false};
+  State state_{State::START_UP};
+  Clock::time_point state_time_, msg_time_, still_since_, in_range_since_, last_hint_;
+  ControllerStatus msg_;
+
+  rclcpp::Subscription<ControllerStatus>::SharedPtr sub_;
+  rclcpp::Publisher<ControlMessage>::SharedPtr pub_;
+  rclcpp::Publisher<PendulumStatus>::SharedPtr status_pub_;
+  rclcpp::Client<AxisState>::SharedPtr axis_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
